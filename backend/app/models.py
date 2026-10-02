@@ -250,3 +250,17 @@ class Postmortem(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
 
     incident: Mapped[Incident] = relationship(back_populates="postmortem")
+
+
+class AIInvestigation(Base):
+    __tablename__ = "ai_investigations"
+    __table_args__ = (Index("ix_ai_investigations_scope_created", "scope", "created_at"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    scope: Mapped[str] = mapped_column(String(120), nullable=False)
+    incident_id: Mapped[int | None] = mapped_column(
+        ForeignKey("incidents.id", ondelete="CASCADE"), nullable=True
+    )
+    provider_status: Mapped[str] = mapped_column(String(32), nullable=False)
+    result_json: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)

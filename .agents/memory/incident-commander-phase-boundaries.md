@@ -3,8 +3,8 @@ name: Incident commander phase boundaries
 description: Current project constraints for the incident commander prototype.
 ---
 
-For the incident commander prototype, do not implement AI or real remediation in this phase. Preserve existing SQLite records when normalizing the schema.
+The incident commander prototype may use optional AI for evidence-grounded investigations, with a deterministic no-credential fallback. AI output must not execute remediation; human actions and recovery checks remain simulation-only.
 
-**Why:** The user explicitly limited this phase to database, API, and frontend integration while excluding AI and real remediation; existing local records must survive the schema transition.
+**Why:** The user requested modular investigation agents while retaining the existing deterministic demonstration and simulated-only operator controls.
 
-**How to apply:** Keep recommendations deterministic and operator actions or recovery checks simulation-only. Perform schema changes without dropping existing records.
+**How to apply:** Gather facts and citations before model calls, validate structured output against stored evidence, use a documented evidence-support score rather than model confidence, and preserve existing SQLite records during schema changes.

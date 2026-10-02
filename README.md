@@ -58,6 +58,20 @@ Keyword search uses an in-process BM25 implementation and works without external
 
 PDF uploads are not supported. The application has no authentication or verified approval system, so upload approval and approver identity are recorded from the submitting operator but are not independently verified. Retrieved text is reference material only: it cannot approve or execute actions. The existing remediation controls remain human-approved simulations.
 
+## AI investigation agents
+
+The existing investigation and checkout simulation remain available unchanged. The optional agent layer adds triage, log-pattern analysis, deployment correlation, local RAG retrieval, testable root-cause hypotheses, an advisory recovery plan, metric-availability validation, and a review-only postmortem draft. Run it from an incident's **Investigation** view or the **Checkout Simulation** view. Reports and their cited evidence are saved in the existing SQLite database.
+
+Without AI settings, all eight roles still run using deterministic rules, stored signals, and the approved-document BM25 knowledge base. To enable AI-assisted sections, configure all three environment variables:
+
+- `INCIDENT_AI_API_URL`: full URL of an OpenAI-compatible Chat Completions endpoint.
+- `INCIDENT_AI_API_KEY`: provider credential. Add it through Replit Secrets; do not commit it.
+- `INCIDENT_AI_MODEL`: model name accepted by that endpoint.
+
+Partial configuration, provider errors, and malformed or unsupported output are reported in the saved investigation; affected agents fall back to deterministic results. Model self-reported confidence is ignored. Root-cause support scores are calculated from cited records (direct metric/log/deployment sources count 2, historical/reference sources count 1, direct contradictions count 2; score = support / (support + contradiction + 2)). This is an evidence-support score, not a calibrated probability.
+
+AI output cannot approve, execute, or modify a remediation. Recovery plans remain advisory; the existing operator approval and recovery controls remain simulation-only. Validation reports when suitable post-action metrics are unavailable rather than claiming an unobserved recovery.
+
 ## Checks
 
 ```bash

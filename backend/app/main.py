@@ -62,6 +62,12 @@ from .services.incident_service import (
     serialize_remediation,
     serialize_service,
 )
+from .services.ai_investigation import (
+    configured_ai_provider,
+    latest_investigation,
+    run_checkout_investigation,
+    run_incident_investigation,
+)
 from .services.checkout_simulation import (
     get_checkout_events,
     get_checkout_health,
@@ -112,8 +118,20 @@ def _incident_or_404(db: Session, incident_id: int) -> Incident:
     return incident
 
 
-def create_app(database_engine: Engine = engine, embedding_provider=None) -> FastAPI:
+_DEFAULT_AI_PROVIDER = object()
+
+
+def create_app(
+    database_engine: Engine = engine,
+    embedding_provider=None,
+    ai_provider=_DEFAULT_AI_PROVIDER,
+) -> FastAPI:
     provider = embedding_provider if embedding_provider is not None else configured_embedding_provider()
+    if ai_provider is _DEFAULT_AI_PROVIDER:
+        analysis_provider, analysis_provider_status = configured_ai_provider()
+    else:
+        analysis_provider = ai_provider
+        analysis_provider_status = "available" if ai_provider is not None else "not_configured"
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -194,6 +212,19 @@ def create_app(database_engine: Engine = engine, embedding_provider=None) -> Fas
         db: Session = Depends(get_db),
     ):
         return get_checkout_events(db, limit)
+
+    @router.get("/simulation/ai-investigation")
+    def get_checkout_ai_investigation(db: Session = Depends(get_db)):
+        result = latest_investigation(db, "checkout_simulation")
+        if result is None:
+            raise HTTPException(status_code=404, detail="No AI investigation has been recorded for the checkout simulation.")
+        return result
+
+    @router.post("/simulation/ai-investigation")
+    def investigate_checkout_with_agents(db: Session = Depends(get_db)):
+        return run_checkout_investigation(
+            db, analysis_provider, analysis_provider_status, provider
+        )
 
     @router.post("/simulation/reset")
     def reset_checkout_demo(db: Session = Depends(get_db)):
@@ -332,6 +363,24 @@ def create_app(database_engine: Engine = engine, embedding_provider=None) -> Fas
     @router.get("/incidents/{incident_id}/investigation")
     def investigation(incident_id: int, db: Session = Depends(get_db)):
         result = get_investigation(db, incident_id)
+        if result is None:
+            raise HTTPException(status_code=404, detail="Incident not found.")
+        return result
+
+    @router.get("/incidents/{incident_id}/ai-investigation")
+    def get_incident_ai_investigation(incident_id: int, db: Session = Depends(get_db)):
+        result = latest_investigation(db, f"incident:{incident_id}")
+        if result is None:
+            if db.get(Incident, incident_id) is None:
+                raise HTTPException(status_code=404, detail="Incident not found.")
+            raise HTTPException(status_code=404, detail="No AI investigation has been recorded for this incident.")
+        return result
+
+    @router.post("/incidents/{incident_id}/ai-investigation")
+    def investigate_incident_with_agents(incident_id: int, db: Session = Depends(get_db)):
+        result = run_incident_investigation(
+            db, incident_id, analysis_provider, analysis_provider_status, provider
+        )
         if result is None:
             raise HTTPException(status_code=404, detail="Incident not found.")
         return result

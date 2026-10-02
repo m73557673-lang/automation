@@ -7,7 +7,7 @@ import {
 import {
   Area, AreaChart, CartesianGrid, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis,
 } from "recharts";
-import { api, type CheckoutSimulationEvents, type CheckoutSimulationHealth, type CheckoutSimulationMetrics, type Dashboard, type Incident, type Investigation, type Postmortem, type Remediation, type Service } from "./api";
+import { api, type AIInvestigation, type CheckoutSimulationEvents, type CheckoutSimulationHealth, type CheckoutSimulationMetrics, type Dashboard, type Incident, type Investigation, type Postmortem, type Remediation, type Service } from "./api";
 import KnowledgeBasePage from "./KnowledgeBasePage";
 
 type Section = "Overview" | "Incidents" | "Investigation" | "Evidence Chain" | "Services & Metrics" | "Checkout Simulation" | "Knowledge Base" | "Remediation" | "Postmortems" | "Settings";
@@ -72,6 +72,7 @@ export default function App() {
   const [services, setServices] = useState<Service[]>([]);
   const [postmortems, setPostmortems] = useState<Postmortem[]>([]);
   const [investigation, setInvestigation] = useState<Investigation | null>(null);
+  const [aiInvestigation, setAiInvestigation] = useState<AIInvestigation | null>(null);
   const [health, setHealth] = useState<"checking" | "ready" | "error">("checking");
   const [loading, setLoading] = useState(true);
   const [investigationLoading, setInvestigationLoading] = useState(false);
@@ -82,9 +83,11 @@ export default function App() {
   const [createOpen, setCreateOpen] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [actionLoading, setActionLoading] = useState(false);
+  const [aiActionLoading, setAiActionLoading] = useState(false);
   const [checkoutMetrics, setCheckoutMetrics] = useState<CheckoutSimulationMetrics | null>(null);
   const [checkoutHealth, setCheckoutHealth] = useState<CheckoutSimulationHealth | null>(null);
   const [checkoutEvents, setCheckoutEvents] = useState<CheckoutSimulationEvents | null>(null);
+  const [checkoutAIInvestigation, setCheckoutAIInvestigation] = useState<AIInvestigation | null>(null);
   const [checkoutLoading, setCheckoutLoading] = useState(false);
   const [checkoutActionLoading, setCheckoutActionLoading] = useState(false);
   const checkoutRequested = useRef(false);
@@ -122,6 +125,8 @@ export default function App() {
     if (current !== null) {
       try { setInvestigation(await api.investigation(current)); }
       catch (reason) { setInvestigation(null); setError((reason instanceof Error ? reason.message : "Could not load investigation")); }
+      try { setAiInvestigation(await api.aiInvestigation(current)); }
+      catch { setAiInvestigation(null); }
     }
     setLoading(false);
   }, []);
@@ -133,6 +138,7 @@ export default function App() {
     setError("");
     const results = await Promise.allSettled([
       api.checkoutSimulation(), api.checkoutSimulationHealth(), api.checkoutSimulationEvents(),
+      api.checkoutAIInvestigation(),
     ]);
     let failed = "";
     if (results[0].status === "fulfilled") setCheckoutMetrics(results[0].value);
@@ -141,6 +147,8 @@ export default function App() {
     else failed ||= `Could not load checkout health: ${results[1].reason instanceof Error ? results[1].reason.message : "Request failed"}`;
     if (results[2].status === "fulfilled") setCheckoutEvents(results[2].value);
     else failed ||= `Could not load checkout events: ${results[2].reason instanceof Error ? results[2].reason.message : "Request failed"}`;
+    if (results[3].status === "fulfilled") setCheckoutAIInvestigation(results[3].value);
+    else failed ||= `Could not load saved AI investigation: ${results[3].reason instanceof Error ? results[3].reason.message : "Request failed"}`;
     setError(failed);
     setCheckoutLoading(false);
   }, []);
@@ -156,10 +164,33 @@ export default function App() {
     setSelectedId(id);
     setInvestigationLoading(true);
     setError("");
-    try { setInvestigation(await api.investigation(id)); }
+    try {
+      setInvestigation(await api.investigation(id));
+      try { setAiInvestigation(await api.aiInvestigation(id)); }
+      catch { setAiInvestigation(null); }
+    }
     catch (reason) { setInvestigation(null); setError(reason instanceof Error ? reason.message : "Could not load this investigation."); }
     finally { setInvestigationLoading(false); }
   }, []);
+
+  async function runAIInvestigation(incidentId: number) {
+    setAiActionLoading(true);
+    setError("");
+    try { setAiInvestigation(await api.runAIInvestigation(incidentId)); }
+    catch (reason) { setError(reason instanceof Error ? reason.message : "Could not run the AI investigation."); }
+    finally { setAiActionLoading(false); }
+  }
+
+  async function runCheckoutAIInvestigation() {
+    setAiActionLoading(true);
+    setError("");
+    try {
+      setCheckoutAIInvestigation(await api.runCheckoutAIInvestigation());
+      await loadCheckout();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Could not run the checkout AI investigation.");
+    } finally { setAiActionLoading(false); }
+  }
 
   const filteredIncidents = useMemo(() => incidents.filter((incident) =>
     `${incident.title} ${incident.service} ${incident.summary} ${incident.id}`.toLowerCase().includes(query.toLowerCase()) &&
@@ -369,6 +400,10 @@ export default function App() {
               {checkoutActionLoading ? <LoaderCircle size={14} /> : <RefreshCw size={14} />}
               Reset to healthy
             </button>
+            <button className="button" onClick={() => void runCheckoutAIInvestigation()} disabled={aiActionLoading}>
+              {aiActionLoading ? <LoaderCircle size={14} /> : <Sparkles size={14} />}
+              {aiActionLoading ? "Investigating…" : "Run AI investigation"}
+            </button>
             <button className="button small" onClick={() => void loadCheckout()} disabled={checkoutLoading || checkoutActionLoading} aria-label="Refresh checkout simulation data">
               <RefreshCw size={13} />{checkoutLoading ? "Refreshing…" : "Refresh"}
             </button>
@@ -445,6 +480,19 @@ export default function App() {
             </article>) : <EmptyState title="No checkout events yet" detail="Deployment and log records will appear here as the simulation runs." icon={Activity} />}
         </div>
       </Surface>
+      {checkoutAIInvestigation
+        ? renderAIInvestigation(
+          checkoutAIInvestigation,
+          () => void runCheckoutAIInvestigation(),
+          aiActionLoading,
+          checkoutAIInvestigation.run_number !== checkoutMetrics.run_number,
+        )
+        : <Surface title="Agent investigation" kicker="Evidence-first · saved to SQLite">
+          <div className="surface-body">
+            <p className="detail-summary">The agents correlate database timeout frequency, DB_POOL_SIZE, checkout traffic, historical incidents, and approved troubleshooting documents.</p>
+            <p className="ai-muted">Run an analysis to save the observed facts, alternative testable hypotheses, advisory recovery plan, validation status, and draft report.</p>
+          </div>
+        </Surface>}
     </>;
   }
 
@@ -456,6 +504,113 @@ export default function App() {
       <div className="pm-section"><strong>Impact</strong><p>{pm.impact}</p></div>
       <div className="pm-section"><strong>Prevention</strong><p>{pm.prevention}</p></div>
     </article>;
+  }
+
+  function renderAIInvestigation(report: AIInvestigation, onRun: () => void, busy: boolean, staleRun = false) {
+    const evidenceById = new Map(report.evidence.map((item) => [item.id, item]));
+    const citations = (ids: string[]) => ids.length ? <div className="ai-citations">
+      {ids.map((id) => {
+        const item = evidenceById.get(id);
+        return <div className="ai-citation" key={id}>
+          <strong>{item?.source ?? id}</strong>
+          <span>{item?.text ?? "Source record unavailable."}</span>
+          {item?.observed_at && <small>{new Date(item.observed_at).toLocaleString()}</small>}
+        </div>;
+      })}
+    </div> : <div className="ai-muted">No supporting records were available.</div>;
+
+    return <Surface
+      title="Agent investigation"
+      kicker={`Saved ${new Date(report.created_at).toLocaleString()} · ${report.provider_status.replace(/_/g, " ")}`}
+      action={<button className="button small" onClick={onRun} disabled={busy}>
+        {busy ? <LoaderCircle size={13} /> : <RefreshCw size={13} />}
+        {busy ? "Investigating…" : "Run again"}
+      </button>}
+    >
+      <div className="surface-body ai-investigation-body">
+        <div className="ai-status-notice">
+          <strong>{report.provider_status === "available" ? "AI-assisted" : "Deterministic fallback"}</strong>
+          <span>{report.provider_message}</span>
+          <small>{report.safety}</small>
+          {staleRun && <strong>This report is from an earlier simulation run. Run the investigation again.</strong>}
+        </div>
+        <div className="ai-section">
+          <h3>Recorded facts</h3>
+          <p className="ai-muted">Observed metrics and logs are kept separate from generated hypotheses.</p>
+          {report.observed_facts.length ? report.observed_facts.map((fact) => <article className="ai-fact" key={fact.id}>
+            <div><strong>{fact.statement}</strong><span>{fact.source} · {fact.kind}</span></div>
+            {citations(fact.evidence_ids)}
+          </article>) : <div className="ai-muted">No matching observations were collected.</div>}
+        </div>
+        <div className="ai-section">
+          <h3>Root-cause hypotheses</h3>
+          <p className="ai-muted">Testable explanations only. Scores are evidence-support scores, not probabilities.</p>
+          {report.agents.root_cause.hypotheses.map((item) => <article className="ai-hypothesis" key={item.key}>
+            <div className="ai-hypothesis-heading">
+              <strong>{item.title}</strong>
+              <span>{Math.round(item.confidence_score * 100)}% evidence support</span>
+            </div>
+            <div className="ai-score-track"><div style={{ width: `${Math.round(item.confidence_score * 100)}%` }} /></div>
+            <span className="ai-hypothesis-label">{item.confidence_label}{item.ai_selected ? " · selected by AI" : " · retained alternative"}</span>
+            <p>{item.explanation}</p>
+            <p><strong>Test:</strong> {item.test}</p>
+            <p className="ai-uncertainty"><strong>Uncertainty:</strong> {item.uncertainty}</p>
+            {citations(item.ai_evidence_ids?.length ? item.ai_evidence_ids : item.evidence_ids)}
+          </article>)}
+          <details className="ai-method">
+            <summary>How the evidence score is calculated</summary>
+            <p>{report.support_score_method}</p><p>{report.support_score_note}</p>
+          </details>
+        </div>
+        <div className="ai-agent-grid">
+          <section className="ai-agent-card">
+            <h3>Triage</h3><p>{report.agents.triage.severity} · {report.agents.triage.scope.replace(/_/g, " ")}</p>
+            <span>{report.agents.triage.note}</span>{citations(report.agents.triage.evidence_ids)}
+          </section>
+          <section className="ai-agent-card">
+            <h3>Log patterns</h3>
+            <p>{report.agents.log_analysis.patterns.map((item) => item.code.replace(/_/g, " ")).join(", ") || "No recognized pattern"}</p>
+            {report.agents.log_analysis.patterns.map((item) => <div key={item.code}>{citations(item.evidence_ids)}</div>)}
+          </section>
+          <section className="ai-agent-card">
+            <h3>Change analysis</h3><p>{report.agents.change_analysis.relationship.replace(/_/g, " ")}</p>
+            <span>{report.agents.change_analysis.note}</span>{citations(report.agents.change_analysis.evidence_ids)}
+          </section>
+          <section className="ai-agent-card">
+            <h3>Knowledge agent · {report.retrieval_mode.replace(/_/g, " ")}</h3>
+            {report.retrieval_warning && <p>{report.retrieval_warning}</p>}
+            {report.agents.knowledge.items.map((item) => <div className="ai-knowledge" key={`${item.document_id}-${item.chunk_index}`}>
+              <strong>{item.title} · {item.source}</strong><p>{item.excerpt}</p>
+            </div>)}
+          </section>
+        </div>
+        <div className="ai-section">
+          <h3>Advisory recovery plan · {report.agents.remediation.risk} risk</h3>
+          <p>{report.agents.remediation.plan}</p>
+          <span>{report.agents.remediation.source}. Human review remains required; this does not approve or execute an action.</span>
+          {citations(report.agents.remediation.evidence_ids)}
+        </div>
+        <div className="ai-agent-grid">
+          <section className="ai-agent-card">
+            <h3>Validation agent</h3><p>{report.agents.validation.assessment.replace(/_/g, " ")}</p>
+            <span>{report.agents.validation.detail}</span>
+            {report.agents.validation.observations?.map((item) => <div className="ai-validation-metric" key={item.metric}>
+              <strong>{item.metric.replace(/_/g, " ")}</strong>
+              <span>{item.before} → {item.after} · {item.change}</span>
+              {citations(item.evidence_ids)}
+            </div>)}
+          </section>
+          <section className="ai-agent-card">
+            <h3>Postmortem draft · review required</h3>
+            <p>{report.agents.postmortem.summary}</p>
+            <span>Impact: {report.agents.postmortem.impact}</span>
+            <span>Timeline: {report.agents.postmortem.timeline}</span>
+            <span>Prevention: {report.agents.postmortem.prevention}</span>
+            {citations(report.agents.postmortem.evidence_ids)}
+          </section>
+        </div>
+      </div>
+    </Surface>;
   }
 
   function renderMain() {
@@ -511,6 +666,13 @@ export default function App() {
         <Surface title="Related runbooks" kicker="Reference material · synthetic workspace" action={<button className="button small" onClick={() => setSection("Knowledge Base")}>Browse knowledge <ArrowRight size={12} /></button>}>
           <div className="surface-body">{investigation.runbooks.length ? investigation.runbooks.slice(0, 2).map((book) => <div className="runbook-card" key={book.id} style={{ marginBottom: 9 }}><h3 className="runbook-title">{book.title}</h3><div className="runbook-meta">{book.service}</div><p className="runbook-content">{book.content.slice(0, 240)}{book.content.length > 240 ? "…" : ""}</p></div>) : <EmptyState title="No related runbooks" detail="Search the knowledge base for applicable guidance." />}</div>
         </Surface>
+        {aiInvestigation
+          ? renderAIInvestigation(aiInvestigation, () => void runAIInvestigation(selected.id), aiActionLoading)
+          : <Surface title="AI investigation" kicker="Evidence-first · advisory only" action={<button className="button small primary" onClick={() => void runAIInvestigation(selected.id)} disabled={aiActionLoading}>
+            {aiActionLoading ? <LoaderCircle size={13} /> : <Sparkles size={13} />}{aiActionLoading ? "Investigating…" : "Run AI investigation"}
+          </button>}>
+            <div className="surface-body"><p className="detail-summary">Classifies the incident, retrieves approved references, proposes evidence-linked hypotheses, and saves a review-only report. Without AI credentials, deterministic agents still run.</p><div className="notice">Generated analysis cannot approve or execute a remediation.</div></div>
+          </Surface>}
         <Surface title="Next operator step" kicker="Explicit human control">
           <div className="surface-body"><p className="detail-summary" style={{ marginBottom: 14 }}>Review the supporting evidence and reference material, then explicitly approve or reject the simulated proposal.</p><button className="button primary" onClick={() => setSection("Remediation")}>Review remediation <ArrowRight size={13} /></button></div>
         </Surface>

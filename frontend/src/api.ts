@@ -221,6 +221,63 @@ export type Investigation = {
   postmortem: Postmortem | null;
 };
 
+export type AIInvestigationHypothesis = {
+  key: string;
+  title: string;
+  explanation: string;
+  test: string;
+  evidence_ids: string[];
+  confidence_score: number;
+  confidence_label: string;
+  uncertainty: string;
+  origin: string;
+  ai_selected?: boolean;
+  ai_evidence_ids?: string[];
+};
+
+export type AIInvestigation = {
+  id: number;
+  created_at: string;
+  scope: string;
+  title: string;
+  service: string;
+  scenario_status: string;
+  run_number?: number;
+  is_synthetic: boolean;
+  provider_status: "not_configured" | "missing_credentials" | "provider_error" | "invalid_response" | "available";
+  provider_message: string;
+  retrieval_mode: string;
+  retrieval_warning: string | null;
+  agents: {
+    triage: { severity: string; scope: string; evidence_ids: string[]; note: string; source: string };
+    log_analysis: { patterns: { code: string; evidence_ids: string[] }[]; source: string };
+    change_analysis: { relationship: string; evidence_ids: string[]; note: string; source: string };
+    root_cause: { hypotheses: AIInvestigationHypothesis[]; source: string };
+    knowledge: { retrieval_mode: string; warning: string | null; items: KnowledgePassage[]; source: string };
+    remediation: { plan_code: string; plan: string; risk: string; evidence_ids: string[]; advisory_only: boolean; source: string };
+    validation: {
+      assessment: string;
+      detail: string;
+      evidence_ids: string[];
+      observations?: { metric: string; before: number; after: number; change: string; evidence_ids: string[] }[];
+      source: string;
+    };
+    postmortem: { summary: string; impact: string; timeline: string; prevention: string; evidence_ids: string[]; source: string; review_required?: boolean };
+  };
+  observed_facts: {
+    id: string;
+    statement: string;
+    evidence_ids: string[];
+    source: string;
+    kind: string;
+    value: unknown;
+  }[];
+  support_score_method: string;
+  support_score_note: string;
+  evidence: { id: string; source: string; kind: string; text: string; observed_at: string | null }[];
+  safety: string;
+};
+
 type Page<T> = { items: T[]; total: number; skip: number; limit: number };
 
 class ApiError extends Error {
@@ -287,6 +344,12 @@ function toRemediation(action: {
 
 export const api = {
   health: () => request<{ status: string; database: string }>("/health"),
+  aiInvestigation: (id: number) => optional<AIInvestigation>(`/incidents/${id}/ai-investigation`),
+  runAIInvestigation: (id: number) =>
+    request<AIInvestigation>(`/incidents/${id}/ai-investigation`, { method: "POST" }),
+  checkoutAIInvestigation: () => optional<AIInvestigation>("/simulation/ai-investigation"),
+  runCheckoutAIInvestigation: () =>
+    request<AIInvestigation>("/simulation/ai-investigation", { method: "POST" }),
   checkoutSimulation: () => request<CheckoutSimulationMetrics>("/simulation/metrics"),
   checkoutSimulationHealth: () => request<CheckoutSimulationHealth>("/simulation/health"),
   checkoutSimulationEvents: () => request<CheckoutSimulationEvents>("/simulation/events"),
