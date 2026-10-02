@@ -7,7 +7,8 @@ import {
 import {
   Area, AreaChart, CartesianGrid, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis,
 } from "recharts";
-import { api, type CheckoutSimulationEvents, type CheckoutSimulationHealth, type CheckoutSimulationMetrics, type Dashboard, type Incident, type Investigation, type Postmortem, type Remediation, type Runbook, type Service } from "./api";
+import { api, type CheckoutSimulationEvents, type CheckoutSimulationHealth, type CheckoutSimulationMetrics, type Dashboard, type Incident, type Investigation, type Postmortem, type Remediation, type Service } from "./api";
+import KnowledgeBasePage from "./KnowledgeBasePage";
 
 type Section = "Overview" | "Incidents" | "Investigation" | "Evidence Chain" | "Services & Metrics" | "Checkout Simulation" | "Knowledge Base" | "Remediation" | "Postmortems" | "Settings";
 const sections: { label: Section; icon: typeof Activity }[] = [
@@ -29,7 +30,7 @@ const sectionCopy: Record<Section, [string, string]> = {
   "Evidence Chain": ["Evidence chain", "A traceable sequence of synthetic signals supporting the investigation."],
   "Services & Metrics": ["Services & metrics", "Scenario metric histories. These charts are simulated, not production telemetry."],
   "Checkout Simulation": ["Checkout simulation", "Practice checkout incident response against deterministic, synthetic service signals."],
-  "Knowledge Base": ["Knowledge base", "Search operational guidance for the selected service and scenario."],
+  "Knowledge Base": ["Knowledge base", "Search approved operational references without treating retrieved text as authorization."],
   Remediation: ["Remediation review", "Explicit operator approval is required before any simulated action is recorded."],
   Postmortems: ["Postmortems", "Generate and review clearly labeled synthetic incident narratives."],
   Settings: ["Workspace settings", "Controls for this isolated simulation workspace."],
@@ -69,7 +70,6 @@ export default function App() {
   const [dashboard, setDashboard] = useState<Dashboard | null>(null);
   const [incidents, setIncidents] = useState<Incident[]>([]);
   const [services, setServices] = useState<Service[]>([]);
-  const [runbooks, setRunbooks] = useState<Runbook[]>([]);
   const [postmortems, setPostmortems] = useState<Postmortem[]>([]);
   const [investigation, setInvestigation] = useState<Investigation | null>(null);
   const [health, setHealth] = useState<"checking" | "ready" | "error">("checking");
@@ -79,8 +79,6 @@ export default function App() {
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const [query, setQuery] = useState("");
   const [severityFilter, setSeverityFilter] = useState("all");
-  const [knowledgeQuery, setKnowledgeQuery] = useState("");
-  const [knowledgeLoading, setKnowledgeLoading] = useState(false);
   const [createOpen, setCreateOpen] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [actionLoading, setActionLoading] = useState(false);
@@ -97,9 +95,9 @@ export default function App() {
     setLoading(true);
     setError("");
     const results = await Promise.allSettled([
-      api.dashboard(), api.incidents(), api.services(), api.knowledge(""), api.postmortems(), api.health(),
+      api.dashboard(), api.incidents(), api.services(), api.postmortems(), api.health(),
     ]);
-    const labels = ["dashboard", "incidents", "services", "knowledge base", "postmortems", "workspace health"];
+    const labels = ["dashboard", "incidents", "services", "postmortems", "workspace health"];
     let failed = "";
     results.forEach((result, index) => {
       if (result.status === "rejected") {
@@ -110,11 +108,10 @@ export default function App() {
       if (index === 0) setDashboard(value as Dashboard);
       if (index === 1) setIncidents(value as Incident[]);
       if (index === 2) setServices(value as Service[]);
-      if (index === 3) setRunbooks(value as Runbook[]);
-      if (index === 4) setPostmortems(value as Postmortem[]);
-      if (index === 5) setHealth("ready");
+      if (index === 3) setPostmortems(value as Postmortem[]);
+      if (index === 4) setHealth("ready");
     });
-    if (results[5].status === "rejected") setHealth("error");
+    if (results[4].status === "rejected") setHealth("error");
     setError(failed);
     const firstIncident = results[1].status === "fulfilled" ? (results[1].value as Incident[])[0] : null;
     const current = selectedIdRef.current ?? firstIncident?.id ?? null;
@@ -209,15 +206,6 @@ export default function App() {
       if (dashboard) setDashboard(await api.dashboard());
     } catch (reason) { setError(reason instanceof Error ? reason.message : "The simulated action could not be completed."); }
     finally { setActionLoading(false); }
-  }
-
-  async function searchKnowledge(event: React.FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    setKnowledgeLoading(true);
-    setError("");
-    try { setRunbooks(await api.knowledge(knowledgeQuery)); }
-    catch (reason) { setError(reason instanceof Error ? reason.message : "Could not search the knowledge base."); }
-    finally { setKnowledgeLoading(false); }
   }
 
   async function startCheckoutIncident() {
@@ -531,15 +519,7 @@ export default function App() {
     if (section === "Evidence Chain") return renderEvidence();
     if (section === "Services & Metrics") return renderServices();
     if (section === "Checkout Simulation") return renderCheckoutSimulation();
-    if (section === "Knowledge Base") return <>
-      <Surface title="Runbook search" kicker="Synthetic operational reference">
-        <form className="surface-body" onSubmit={(event) => void searchKnowledge(event)} style={{ display: "flex", gap: 9 }}>
-          <div className="search-box" style={{ flex: 1 }}><Search size={14} /><input aria-label="Search runbooks" placeholder="Search by service, tag, or topic…" value={knowledgeQuery} onChange={(event) => setKnowledgeQuery(event.target.value)} /></div>
-          <button className="button primary" type="submit" disabled={knowledgeLoading}>{knowledgeLoading ? <LoaderCircle size={14} /> : <Search size={14} />}Search</button>
-        </form>
-      </Surface>
-      <div style={{ marginTop: 14 }}>{knowledgeLoading ? <LoadingState /> : runbooks.length ? <div className="section-grid">{runbooks.map((book) => <article className="runbook-card" key={book.id}><div className="runbook-meta">{book.service} · Runbook {String(book.id).padStart(3, "0")}</div><h3 className="runbook-title" style={{ marginTop: 8 }}>{book.title}</h3><p className="runbook-content">{book.content}</p><div className="tag-row">{book.tags.map((tag) => <span className="tag" key={tag}>{tag}</span>)}</div></article>)}</div> : <EmptyState title="No matching guidance" detail="Try a broader service name or operational keyword." icon={BookOpen} />}</div>
-    </>;
+    if (section === "Knowledge Base") return <KnowledgeBasePage />;
     if (section === "Remediation") return renderRemediation();
     if (section === "Postmortems") return <>
       <Surface title="Generate synthetic postmortem" kicker="Built from selected scenario context" action={<span className="simulation-tag">Synthetic only</span>}>
@@ -585,7 +565,7 @@ export default function App() {
       </header>
       <div className="content">
         {error && <div className="error-banner" role="alert"><span><AlertTriangle size={14} style={{ verticalAlign: "middle", marginRight: 7 }} />{error}</span><button className="button small" onClick={() => section === "Checkout Simulation" ? void loadCheckout() : void load()}><RefreshCw size={12} />Retry</button></div>}
-        <div className="page-head"><div><div className="eyebrow">Autonomous AI-powered incident commander</div><h1>{heading}</h1><p className="page-desc">{description}</p></div><div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}><SyntheticTag />{section === "Incidents" && <button className="button primary" onClick={() => setCreateOpen(true)}><Plus size={14} />Create scenario</button>}</div></div>
+        {section !== "Knowledge Base" && <div className="page-head"><div><div className="eyebrow">Autonomous AI-powered incident commander</div><h1>{heading}</h1><p className="page-desc">{description}</p></div><div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}><SyntheticTag />{section === "Incidents" && <button className="button primary" onClick={() => setCreateOpen(true)}><Plus size={14} />Create scenario</button>}</div></div>}
         {renderMain()}
       </div>
     </main>

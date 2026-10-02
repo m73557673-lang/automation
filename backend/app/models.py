@@ -1,6 +1,7 @@
 from datetime import datetime, timezone
 
 from sqlalchemy import (
+    Boolean,
     CheckConstraint,
     DateTime,
     Float,
@@ -133,6 +134,49 @@ class KnowledgeDocument(Base):
     content: Mapped[str] = mapped_column(Text, nullable=False)
     source: Mapped[str] = mapped_column(String(200), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+
+class OperationalDocument(Base):
+    __tablename__ = "operational_documents"
+    __table_args__ = (
+        Index("ix_operational_documents_status_created", "approval_status", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    title: Mapped[str] = mapped_column(String(180), nullable=False)
+    source: Mapped[str] = mapped_column(String(500), nullable=False)
+    original_filename: Mapped[str] = mapped_column(String(255), nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    approval_status: Mapped[str] = mapped_column(String(24), default="approved", nullable=False)
+    approved_by: Mapped[str] = mapped_column(String(120), nullable=False)
+    is_synthetic: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    indexing_status: Mapped[str] = mapped_column(String(24), default="indexed", nullable=False)
+    indexed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    source_metadata: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+    chunks: Mapped[list["OperationalDocumentChunk"]] = relationship(
+        back_populates="document", cascade="all, delete-orphan", order_by="OperationalDocumentChunk.chunk_index"
+    )
+
+
+class OperationalDocumentChunk(Base):
+    __tablename__ = "operational_document_chunks"
+    __table_args__ = (
+        UniqueConstraint("document_id", "chunk_index", name="uq_operational_document_chunk"),
+        Index("ix_operational_document_chunks_document", "document_id", "chunk_index"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    document_id: Mapped[int] = mapped_column(
+        ForeignKey("operational_documents.id", ondelete="CASCADE"), nullable=False
+    )
+    chunk_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    token_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    embedding_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    document: Mapped[OperationalDocument] = relationship(back_populates="chunks")
 
 
 class Evidence(Base):

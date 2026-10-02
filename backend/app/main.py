@@ -3,7 +3,7 @@ import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Body, Depends, FastAPI, HTTPException, Query, Request, status
+from fastapi import APIRouter, Body, Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from sqlalchemy import func, or_, select, text
@@ -19,6 +19,8 @@ from .models import (
     Incident,
     KnowledgeDocument,
     Metric,
+    OperationalDocument,
+    OperationalDocumentChunk,
     Postmortem,
     Recommendation,
     Service,
@@ -68,6 +70,19 @@ from .services.checkout_simulation import (
     reset_checkout_simulation,
     start_checkout_simulation,
 )
+from .services.knowledge_base import (
+    MAX_UPLOAD_BYTES,
+    SUPPORTED_UPLOAD_EXTENSIONS,
+    configured_embedding_provider,
+    index_document,
+    list_documents,
+    retrieve_chunk,
+    retrieve_document,
+    search_documents,
+    seed_operational_documents,
+    serialize_document,
+    serialize_passage,
+)
 
 
 class JsonFormatter(logging.Formatter):
@@ -97,7 +112,9 @@ def _incident_or_404(db: Session, incident_id: int) -> Incident:
     return incident
 
 
-def create_app(database_engine: Engine = engine) -> FastAPI:
+def create_app(database_engine: Engine = engine, embedding_provider=None) -> FastAPI:
+    provider = embedding_provider if embedding_provider is not None else configured_embedding_provider()
+
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         initialize_database(database_engine)
@@ -105,6 +122,7 @@ def create_app(database_engine: Engine = engine) -> FastAPI:
         with factory() as db:
             seed_database(db)
             initialize_checkout_simulation(db)
+            seed_operational_documents(db, provider)
         logger.info("normalized SQLite database initialized")
         yield
 
@@ -342,6 +360,127 @@ def create_app(database_engine: Engine = engine) -> FastAPI:
             statement.order_by(KnowledgeDocument.title).offset(skip).limit(limit)
         ).all()
         return _page([serialize_knowledge(item) for item in records], total, skip, limit)
+
+    @router.get("/knowledge/status")
+    def knowledge_status(db: Session = Depends(get_db)):
+        documents = db.scalars(select(OperationalDocument)).all()
+        chunk_count = db.scalar(select(func.count()).select_from(OperationalDocumentChunk)) or 0
+        return {
+            "document_count": len(documents),
+            "indexed_document_count": sum(item.indexing_status == "indexed" for item in documents),
+            "chunk_count": chunk_count,
+            "synthetic_document_count": sum(item.is_synthetic for item in documents),
+            "retrieval_mode": "semantic" if provider else "keyword_bm25",
+            "supported_extensions": sorted(SUPPORTED_UPLOAD_EXTENSIONS),
+        }
+
+    @router.get("/knowledge/documents")
+    def operational_documents(
+        skip: int = Query(default=0, ge=0),
+        limit: int = Query(default=50, ge=1, le=100),
+        db: Session = Depends(get_db),
+    ):
+        documents, total = list_documents(db, skip, limit)
+        return _page([serialize_document(item) for item in documents], total, skip, limit)
+
+    @router.post("/knowledge/documents", status_code=status.HTTP_201_CREATED)
+    async def upload_operational_document(
+        file: UploadFile = File(...),
+        source: str = Form(..., min_length=2, max_length=500),
+        approved_by: str = Form(..., min_length=2, max_length=120),
+        approved: bool = Form(...),
+        title: str | None = Form(default=None, max_length=180),
+        db: Session = Depends(get_db),
+    ):
+        from pathlib import PurePosixPath
+
+        filename = PurePosixPath((file.filename or "").replace("\\", "/")).name
+        extension = PurePosixPath(filename).suffix.lower()
+        if extension not in SUPPORTED_UPLOAD_EXTENSIONS:
+            raise HTTPException(
+                status_code=415,
+                detail="Only plain text (.txt) and Markdown (.md, .markdown) uploads are supported.",
+            )
+        if not approved:
+            raise HTTPException(
+                status_code=400,
+                detail="The document must be approved before it can be indexed.",
+            )
+        raw_content = await file.read(MAX_UPLOAD_BYTES + 1)
+        if len(raw_content) > MAX_UPLOAD_BYTES:
+            raise HTTPException(status_code=413, detail="Documents must be 1 MB or smaller.")
+        try:
+            content = raw_content.decode("utf-8-sig").strip()
+        except UnicodeDecodeError as exc:
+            raise HTTPException(status_code=400, detail="Upload must be valid UTF-8 text.") from exc
+        if not content:
+            raise HTTPException(status_code=400, detail="The document is empty.")
+        clean_source = source.strip()
+        clean_approver = approved_by.strip()
+        if len(clean_source) < 2 or len(clean_approver) < 2:
+            raise HTTPException(
+                status_code=422,
+                detail="Source attribution and approver name must contain at least two non-space characters.",
+            )
+        clean_title = (title or "").strip() or PurePosixPath(filename).stem.replace("_", " ").replace("-", " ")
+        try:
+            document = index_document(
+                db,
+                title=clean_title,
+                source=clean_source,
+                filename=filename,
+                content=content,
+                approved_by=clean_approver,
+                is_synthetic=False,
+                provider=provider,
+                source_metadata={
+                    "uploaded_filename": filename,
+                    "content_type": file.content_type,
+                    "approval_confirmed": True,
+                },
+            )
+        except RuntimeError as exc:
+            db.rollback()
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        logger.info("approved operational document indexed document_id=%s", document.id)
+        return serialize_document(document)
+
+    @router.get("/knowledge/documents/{document_id}")
+    def operational_document_detail(document_id: int, db: Session = Depends(get_db)):
+        document = retrieve_document(db, document_id)
+        if document is None:
+            raise HTTPException(status_code=404, detail="Knowledge document not found.")
+        return serialize_document(document)
+
+    @router.get("/knowledge/documents/{document_id}/chunks/{chunk_index}")
+    def operational_document_chunk(
+        document_id: int,
+        chunk_index: int,
+        db: Session = Depends(get_db),
+    ):
+        result = retrieve_chunk(db, document_id, chunk_index)
+        if result is None:
+            raise HTTPException(status_code=404, detail="Knowledge passage not found.")
+        document, chunk = result
+        return serialize_passage(document, chunk)
+
+    @router.get("/knowledge/search")
+    def search_operational_knowledge(
+        q: str = Query(min_length=1, max_length=500),
+        limit: int = Query(default=10, ge=1, le=25),
+        db: Session = Depends(get_db),
+    ):
+        if not q.strip():
+            raise HTTPException(status_code=422, detail="Enter a search query.")
+        try:
+            retrieval_mode, passages = search_documents(db, q.strip(), limit, provider)
+        except (RuntimeError, ValueError) as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        return {
+            "query": q.strip(),
+            "retrieval_mode": retrieval_mode,
+            "items": passages,
+        }
 
     @router.get("/postmortems", response_model=PostmortemPage)
     def postmortems(

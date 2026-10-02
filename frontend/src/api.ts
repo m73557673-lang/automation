@@ -42,6 +42,55 @@ export type Runbook = {
   tags: string[];
 };
 
+export type KnowledgeBaseStatus = {
+  document_count: number;
+  indexed_document_count: number;
+  chunk_count: number;
+  synthetic_document_count: number;
+  retrieval_mode: "keyword_bm25" | "semantic";
+  supported_extensions: string[];
+};
+
+export type KnowledgeBaseDocument = {
+  id: number;
+  title: string;
+  source: string;
+  original_filename: string;
+  approval_status: string;
+  approved_by: string;
+  is_synthetic: boolean;
+  indexing_status: string;
+  indexed_chunk_count: number;
+  indexed_at: string | null;
+  created_at: string;
+  excerpt: string;
+  source_metadata: Record<string, unknown>;
+};
+
+export type KnowledgePassage = {
+  document_id: number;
+  title: string;
+  source: string;
+  excerpt: string;
+  chunk_index: number;
+  score?: number;
+  is_synthetic: boolean;
+  approval_status: string;
+};
+
+export type KnowledgeSearchResponse = {
+  query: string;
+  retrieval_mode: "keyword_bm25" | "semantic";
+  items: KnowledgePassage[];
+};
+
+export type KnowledgeDocumentPage = {
+  items: KnowledgeBaseDocument[];
+  total: number;
+  skip: number;
+  limit: number;
+};
+
 export type Service = {
   id: number;
   name: string;
@@ -182,9 +231,12 @@ class ApiError extends Error {
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const headers = init?.body instanceof FormData
+    ? { ...init.headers }
+    : { "Content-Type": "application/json", ...init?.headers };
   const response = await fetch(`/api${path}`, {
     ...init,
-    headers: { "Content-Type": "application/json", ...init?.headers },
+    headers,
   });
   if (!response.ok) {
     const body = await response.json().catch(() => null);
@@ -281,6 +333,29 @@ export const api = {
   },
   services: () => pageItems<Service>("/services?skip=0&limit=100"),
   knowledge: (query: string) => pageItems<Runbook>(`/knowledge?q=${encodeURIComponent(query)}&skip=0&limit=100`),
+  knowledgeBaseStatus: () => request<KnowledgeBaseStatus>("/knowledge/status"),
+  knowledgeDocuments: () => request<KnowledgeDocumentPage>("/knowledge/documents?skip=0&limit=100"),
+  knowledgeDocument: (id: number) => request<KnowledgeBaseDocument>(`/knowledge/documents/${id}`),
+  knowledgePassage: (documentId: number, chunkIndex: number) =>
+    request<KnowledgePassage>(`/knowledge/documents/${documentId}/chunks/${chunkIndex}`),
+  searchKnowledgePassages: (query: string, limit = 10) =>
+    request<KnowledgeSearchResponse>(`/knowledge/search?q=${encodeURIComponent(query)}&limit=${limit}`),
+  uploadKnowledgeDocument: (file: File, metadata: {
+    title: string;
+    source: string;
+    approvedBy: string;
+  }) => {
+    const form = new FormData();
+    form.append("file", file);
+    form.append("title", metadata.title);
+    form.append("source", metadata.source);
+    form.append("approved_by", metadata.approvedBy);
+    form.append("approved", "true");
+    return request<KnowledgeBaseDocument>("/knowledge/documents", {
+      method: "POST",
+      body: form,
+    });
+  },
   approveRemediation: (incidentId: number) =>
     request<Remediation>(`/incidents/${incidentId}/remediation/approve`, {
       method: "POST",
