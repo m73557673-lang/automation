@@ -7,15 +7,16 @@ import {
 import {
   Area, AreaChart, CartesianGrid, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis,
 } from "recharts";
-import { api, type AIInvestigation, type CheckoutSimulationEvents, type CheckoutSimulationHealth, type CheckoutSimulationMetrics, type Dashboard, type Incident, type Investigation, type Postmortem, type Remediation, type Service } from "./api";
+import { api, type AIInvestigation, type CheckoutSimulationEvents, type CheckoutSimulationHealth, type CheckoutSimulationMetrics, type Dashboard, type Incident, type Investigation, type Postmortem, type Remediation, type Service, type StoredEvidenceDetail } from "./api";
 import KnowledgeBasePage from "./KnowledgeBasePage";
 
-type Section = "Overview" | "Incidents" | "Investigation" | "Evidence Chain" | "Services & Metrics" | "Checkout Simulation" | "Knowledge Base" | "Remediation" | "Postmortems" | "Settings";
+type Section = "Overview" | "Incidents" | "Investigation" | "Evidence Chain" | "Root Cause" | "Services & Metrics" | "Checkout Simulation" | "Knowledge Base" | "Remediation" | "Postmortems" | "Settings";
 const sections: { label: Section; icon: typeof Activity }[] = [
   { label: "Overview", icon: Activity },
   { label: "Incidents", icon: AlertTriangle },
   { label: "Investigation", icon: Search },
   { label: "Evidence Chain", icon: GitBranch },
+  { label: "Root Cause", icon: AlertTriangle },
   { label: "Services & Metrics", icon: Server },
   { label: "Checkout Simulation", icon: ShoppingCart },
   { label: "Knowledge Base", icon: BookOpen },
@@ -28,6 +29,7 @@ const sectionCopy: Record<Section, [string, string]> = {
   Incidents: ["Incident queue", "Review and select a scenario to inspect its evidence and recommended response."],
   Investigation: ["Investigation", "Correlate the evidence trail and consult relevant runbooks."],
   "Evidence Chain": ["Evidence chain", "A traceable sequence of synthetic signals supporting the investigation."],
+  "Root Cause": ["Root cause analysis", "Review persisted hypotheses, evidence support, contradictions, and missing data."],
   "Services & Metrics": ["Services & metrics", "Scenario metric histories. These charts are simulated, not production telemetry."],
   "Checkout Simulation": ["Checkout simulation", "Practice checkout incident response against deterministic, synthetic service signals."],
   "Knowledge Base": ["Knowledge base", "Search approved operational references without treating retrieved text as authorization."],
@@ -80,6 +82,10 @@ export default function App() {
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const [query, setQuery] = useState("");
   const [severityFilter, setSeverityFilter] = useState("all");
+  const [evidenceScope, setEvidenceScope] = useState<"incident" | "checkout">("incident");
+  const [evidenceTypeFilter, setEvidenceTypeFilter] = useState("all");
+  const [evidenceDetail, setEvidenceDetail] = useState<StoredEvidenceDetail | null>(null);
+  const [evidenceDetailLoading, setEvidenceDetailLoading] = useState(false);
   const [createOpen, setCreateOpen] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [actionLoading, setActionLoading] = useState(false);
@@ -162,6 +168,8 @@ export default function App() {
 
   const selectIncident = useCallback(async (id: number) => {
     setSelectedId(id);
+    setEvidenceScope("incident");
+    setEvidenceTypeFilter("all");
     setInvestigationLoading(true);
     setError("");
     try {
@@ -190,6 +198,43 @@ export default function App() {
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "Could not run the checkout AI investigation.");
     } finally { setAiActionLoading(false); }
+  }
+
+  async function changeEvidenceScope(scope: "incident" | "checkout") {
+    setEvidenceScope(scope);
+    setEvidenceTypeFilter("all");
+    if (scope !== "checkout") return;
+    setCheckoutLoading(true);
+    setError("");
+    try {
+      const [metrics, report] = await Promise.all([
+        api.checkoutSimulation(),
+        api.checkoutAIInvestigation(),
+      ]);
+      setCheckoutMetrics(metrics);
+      setCheckoutAIInvestigation(report);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Could not load the saved checkout investigation.");
+    } finally {
+      setCheckoutLoading(false);
+    }
+  }
+
+  async function openStoredEvidence(ref: string, scope: "incident" | "checkout" = evidenceScope) {
+    setEvidenceDetail(null);
+    setEvidenceDetailLoading(true);
+    setError("");
+    try {
+      const detail = scope === "checkout"
+        ? await api.checkoutAIEvidence(ref)
+        : selected ? await api.incidentAIEvidence(selected.id, ref) : null;
+      if (!detail) throw new Error("Select an incident before opening its evidence.");
+      setEvidenceDetail(detail);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Could not open the stored evidence record.");
+    } finally {
+      setEvidenceDetailLoading(false);
+    }
   }
 
   const filteredIncidents = useMemo(() => incidents.filter((incident) =>
@@ -279,33 +324,241 @@ export default function App() {
     finally { setActionLoading(false); }
   }
 
+  function evidenceScopePicker() {
+    return <label className="evidence-scope-picker">
+      <span>Investigation source</span>
+      <select
+        className="select"
+        value={evidenceScope}
+        onChange={(event) => void changeEvidenceScope(event.target.value as "incident" | "checkout")}
+      >
+        <option value="incident">{selected ? `Incident · ${selected.title}` : "Selected incident"}</option>
+        <option value="checkout">Checkout DB_POOL_SIZE demo</option>
+      </select>
+    </label>;
+  }
+
+  function renderEvidenceDetail() {
+    if (!evidenceDetail && !evidenceDetailLoading) return null;
+    return <div className="evidence-modal-backdrop" role="presentation" onMouseDown={(event) => {
+      if (event.target === event.currentTarget) setEvidenceDetail(null);
+    }}>
+      <section className="evidence-modal" role="dialog" aria-modal="true" aria-labelledby="evidence-modal-title">
+        <div className="surface-head">
+          <div><div id="evidence-modal-title" className="surface-title">Original stored evidence</div><div className="surface-kicker">Read-only database record</div></div>
+          <button className="button small" aria-label="Close evidence detail" onClick={() => setEvidenceDetail(null)}><X size={13} /></button>
+        </div>
+        {evidenceDetailLoading ? <div className="surface-body"><LoadingState /></div> : evidenceDetail && <div className="surface-body evidence-modal-content">
+          <div><span>Identifier</span><code>{evidenceDetail.id}</code></div>
+          <div><span>Source type</span><strong>{evidenceDetail.source_type.replace(/_/g, " ")}</strong></div>
+          <div><span>Source reference</span><code>{evidenceDetail.source_reference}</code></div>
+          <div><span>Timestamp</span><strong>{evidenceDetail.timestamp ? new Date(evidenceDetail.timestamp).toLocaleString() : "No event timestamp stored"}</strong></div>
+          <div><span>Source</span><strong>{evidenceDetail.source}</strong></div>
+          {evidenceDetail.value !== null && <div><span>Value</span><strong>{evidenceDetail.value}</strong></div>}
+          <div className="evidence-modal-excerpt"><span>Original excerpt</span><p>{evidenceDetail.excerpt}</p></div>
+        </div>}
+      </section>
+    </div>;
+  }
+
   function renderEvidence() {
-    if (investigationLoading) return <LoadingState />;
-    if (!selected) return <EmptyState title="Select an incident" detail="Choose a scenario from the incident queue to inspect its evidence chain." icon={GitBranch} />;
-    if (!investigation) return <EmptyState title="Investigation unavailable" detail="Retry the selected scenario to load its synthetic evidence." icon={AlertTriangle} />;
-    return <>
-      <div className="chain surface" style={{ padding: 16, marginBottom: 14 }}>
-        {[
-          ["01", "Scenario", "Seeded incident context"],
-          ["02", "Signals", `${investigation.evidence.length} correlated evidence items`],
-          ["03", "Guidance", `${investigation.runbooks.length} related runbooks`],
-          ["04", "Decision", investigation.remediation ? `Remediation ${investigation.remediation.state}` : "Awaiting operator review"],
-        ].map(([number, label, sub]) => <div className="chain-step" key={number}><div className="chain-top"><div className="chain-num">{number}</div><span className="chain-label">{label}</span></div><div className="chain-sub">{sub}</div></div>)}
+    const report = evidenceScope === "checkout" ? checkoutAIInvestigation : aiInvestigation;
+    const incidentBusy = evidenceScope === "incident" && investigationLoading;
+    if (incidentBusy || (evidenceScope === "checkout" && checkoutLoading)) return <LoadingState />;
+    if (evidenceScope === "incident" && !selected) return <EmptyState title="Select an incident" detail="Choose a scenario from the incident queue to inspect its saved evidence chain." icon={GitBranch} />;
+    if (!report) return <div className="evidence-page">
+      {evidenceScopePicker()}
+      <Surface title="No persisted investigation" kicker="Evidence is not generated or inferred on this page">
+        <div className="surface-body">
+          <EmptyState
+            title="No saved evidence chain yet"
+            detail={evidenceScope === "incident"
+              ? "Run an investigation to save the source records, timestamps, and cited hypotheses for this incident."
+              : "Start the synthetic pool-reduction scenario in Checkout Simulation, then save its investigation."}
+            icon={GitBranch}
+          />
+          {evidenceScope === "incident" && selected
+            ? <button className="button primary" onClick={() => void runAIInvestigation(selected.id)} disabled={aiActionLoading}><Sparkles size={13} />{aiActionLoading ? "Investigating…" : "Run and save investigation"}</button>
+            : <button className="button primary" onClick={() => setSection("Checkout Simulation")}><ShoppingCart size={13} />Open Checkout Simulation</button>}
+        </div>
+      </Surface>
+    </div>;
+
+    const rootHypotheses = report.agents.root_cause.hypotheses;
+    const entries = [
+      ...report.evidence.map((item) => ({
+        id: item.id,
+        sourceReference: item.source_ref ?? item.id,
+        sourceType: item.kind === "knowledge"
+          ? item.record_class === "historical" ? "historical_incident" : "runbook_excerpt"
+          : item.kind === "log" ? "application_log"
+            : item.kind === "deployment" ? "deployment_or_configuration" : item.kind,
+        timestamp: item.observed_at,
+        source: item.source,
+        excerpt: item.excerpt ?? item.text,
+        value: item.value ?? null,
+        evidenceRef: item.id,
+        hypothesis: false,
+      })),
+      ...rootHypotheses.map((hypothesis) => ({
+        id: `hypothesis:${hypothesis.key}`,
+        sourceReference: `ai_investigation:${report.id}#${hypothesis.key}`,
+        sourceType: "root_cause_hypothesis",
+        timestamp: report.created_at,
+        source: hypothesis.origin,
+        excerpt: hypothesis.explanation,
+        value: hypothesis.confidence_score,
+        evidenceRef: null,
+        hypothesis: true,
+      })),
+    ].sort((a, b) => {
+      if (!a.timestamp) return b.timestamp ? 1 : a.id.localeCompare(b.id);
+      if (!b.timestamp) return -1;
+      return new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime();
+    });
+    const filteredEntries = evidenceTypeFilter === "all"
+      ? entries
+      : entries.filter((item) => item.sourceType === evidenceTypeFilter);
+    const typeOptions = [...new Set(entries.map((item) => item.sourceType))].sort();
+    const staleCheckoutReport = evidenceScope === "checkout"
+      && checkoutMetrics !== null
+      && report.run_number !== checkoutMetrics.run_number;
+
+    return <div className="evidence-page">
+      <div className="evidence-page-toolbar">
+        {evidenceScopePicker()}
+        <label className="evidence-scope-picker">
+          <span>Filter by evidence type</span>
+          <select className="select" value={evidenceTypeFilter} onChange={(event) => setEvidenceTypeFilter(event.target.value)}>
+            <option value="all">All types · {entries.length}</option>
+            {typeOptions.map((type) => <option key={type} value={type}>{type.replace(/_/g, " ")} · {entries.filter((item) => item.sourceType === type).length}</option>)}
+          </select>
+        </label>
+        <div className="evidence-report-meta">Saved investigation #{report.id} · {new Date(report.created_at).toLocaleString()}</div>
       </div>
-      <Surface title={`${investigation.evidence.length} evidence records`} kicker={`${selected.title} · simulated`} action={<SyntheticTag />}>
-        <div className="surface-body">{investigation.evidence.length ? investigation.evidence.map((item) => <div className="evidence-row" key={item.id}>
-          <div className="evidence-kind">{item.kind}</div>
-          <div><div className="evidence-msg">{item.message}</div><div className="evidence-source">{item.source} · {new Date(item.observed_at).toLocaleString()}</div></div>
-          <div className="confidence">{item.confidence === null ? "—" : `${Math.round(item.confidence * 100)}% conf.`}</div>
-        </div>) : <EmptyState title="No evidence recorded" detail="This synthetic scenario has no evidence records yet." />}</div>
+      {staleCheckoutReport && <div className="notice evidence-stale-notice">The checkout simulation has changed since this report was saved. Re-run the investigation to refresh this timeline.</div>}
+      <Surface title={`${filteredEntries.length} timeline entries`} kicker={`${report.title} · chronological · stored evidence`} action={<SyntheticTag />}>
+        <div className="evidence-timeline">
+          {filteredEntries.length ? filteredEntries.map((item) => <article className="evidence-timeline-item" key={item.id}>
+            <div className={`evidence-timeline-mark ${item.sourceType}`} />
+            <div className="evidence-timeline-card">
+              <div className="evidence-timeline-heading">
+                <span className="evidence-kind">{item.sourceType.replace(/_/g, " ")}</span>
+                <time>{item.timestamp ? new Date(item.timestamp).toLocaleString() : "No event timestamp stored"}</time>
+              </div>
+              <div className="evidence-timeline-source">{item.source}</div>
+              <p>{item.excerpt}</p>
+              {item.value !== null && <div className="evidence-timeline-value">{item.hypothesis ? `${Math.round(Number(item.value) * 100)}% heuristic support` : `Recorded value: ${item.value}`}</div>}
+              <div className="evidence-timeline-ref"><span>Stable ID</span><code>{item.id}</code><span>Source reference</span><code>{item.sourceReference}</code></div>
+              {item.evidenceRef
+                ? <button className="button small" onClick={() => void openStoredEvidence(item.evidenceRef!, evidenceScope)}>Open original record <ArrowRight size={12} /></button>
+                : <button className="button small" onClick={() => setSection("Root Cause")}>Open saved hypothesis <ArrowRight size={12} /></button>}
+            </div>
+          </article>) : <EmptyState title="No items match this filter" detail="Choose another evidence type or return to all timeline entries." icon={Filter} />}
+        </div>
       </Surface>
-      <Surface title="Metric snapshots" kicker={`${investigation.metrics.length} records · local database`}>
-        <div className="surface-body">{investigation.metrics.length ? investigation.metrics.map((metric) => <div className="activity-item" key={metric.id}>
-          <div className="activity-mark" /><div><div className="activity-title">{metric.metric_name.replace(/_/g, " ")}</div>
-            <div className="activity-detail">{metric.value} · {new Date(metric.timestamp).toLocaleString()}</div></div>
-        </div>) : <EmptyState title="No metric snapshots" detail="No metric records are linked to this incident's service and time window." />}</div>
+      <Surface title="Evidence interpretation" kicker="Observed records are separate from model-selected hypotheses">
+        <div className="surface-body"><p className="detail-summary">The timeline contains only records attached to the saved investigation. Hypothesis entries are clearly labeled and point back to the persisted report; they are not original telemetry.</p><button className="button small" onClick={() => setSection("Root Cause")}>Review hypothesis support <ArrowRight size={12} /></button></div>
       </Surface>
-    </>;
+      {renderEvidenceDetail()}
+    </div>;
+  }
+
+  function renderRootCause() {
+    const report = evidenceScope === "checkout" ? checkoutAIInvestigation : aiInvestigation;
+    const busy = evidenceScope === "incident" ? investigationLoading : checkoutLoading;
+    if (busy) return <LoadingState />;
+    if (evidenceScope === "incident" && !selected) return <EmptyState title="Select an incident" detail="Choose an incident to review its saved root-cause hypotheses." icon={AlertTriangle} />;
+    if (!report) return <div className="evidence-page">
+      {evidenceScopePicker()}
+      <Surface title="No persisted root-cause report" kicker="This page reads saved investigation output">
+        <div className="surface-body">
+          <EmptyState
+            title="No hypotheses saved"
+            detail={evidenceScope === "incident"
+              ? "Run an investigation to create evidence-linked hypotheses for this incident."
+              : "Run the Checkout Simulation and save its AI investigation to review the DB_POOL_SIZE scenario."}
+            icon={AlertTriangle}
+          />
+          {evidenceScope === "incident" && selected
+            ? <button className="button primary" onClick={() => void runAIInvestigation(selected.id)} disabled={aiActionLoading}><Sparkles size={13} />{aiActionLoading ? "Investigating…" : "Run and save investigation"}</button>
+            : <button className="button primary" onClick={() => setSection("Checkout Simulation")}><ShoppingCart size={13} />Open Checkout Simulation</button>}
+        </div>
+      </Surface>
+    </div>;
+
+    const hypotheses = report.agents.root_cause.hypotheses;
+    const poolFact = report.observed_facts.find((fact) => fact.id === "pool_size_change");
+    const staleCheckoutReport = evidenceScope === "checkout"
+      && checkoutMetrics !== null
+      && report.run_number !== checkoutMetrics.run_number;
+    const citations = (refs: string[]) => refs.length
+      ? <div className="root-cause-citations">{refs.map((ref) => {
+        const item = report.evidence.find((evidence) => evidence.id === ref);
+        return <button key={ref} className="root-cause-citation" onClick={() => void openStoredEvidence(ref, evidenceScope)}>
+          <strong>{item?.source ?? ref}</strong><span>{item?.excerpt ?? item?.text ?? "Stored source record"}</span><code>{ref}</code>
+        </button>;
+      })}</div>
+      : <p className="ai-muted">No direct records of this type were cited.</p>;
+
+    return <div className="evidence-page">
+      <div className="evidence-page-toolbar">
+        {evidenceScopePicker()}
+        <div className="evidence-report-meta">Saved investigation #{report.id} · {new Date(report.created_at).toLocaleString()}</div>
+        <button className="button small" onClick={() => evidenceScope === "checkout"
+          ? void runCheckoutAIInvestigation()
+          : selected && void runAIInvestigation(selected.id)} disabled={aiActionLoading}>
+          {aiActionLoading ? <LoaderCircle size={13} /> : <RefreshCw size={13} />} Re-run from stored evidence
+        </button>
+      </div>
+      {staleCheckoutReport && <div className="notice evidence-stale-notice">This saved report predates the current checkout simulation run. Re-run it before interpreting the latest signals.</div>}
+      {poolFact && <Surface title="DB_POOL_SIZE scenario evidence" kicker="Derived from persisted metric and configuration records">
+        <div className="surface-body">
+          <p className="root-cause-pool-fact">{poolFact.statement}</p>
+          {citations(poolFact.evidence_ids)}
+          <p className="ai-muted">This summary is calculated from the cited stored samples. No fixed confidence value is applied.</p>
+        </div>
+      </Surface>}
+      <Surface title="Investigation summary" kicker={`${report.service} · ${report.provider_message}`}>
+        <div className="surface-body">
+          <p className="detail-summary">{hypotheses.length
+            ? `${hypotheses.length} testable explanations are retained. The highest evidence-support score is a heuristic ranking, not proof of cause.`
+            : "The saved investigation contains no root-cause hypotheses."}</p>
+          <div className="notice">Several causes can remain plausible at once. Correlation and heuristic scores do not establish causation.</div>
+          {report.retrieval_warning && <div className="notice">{report.retrieval_warning}</div>}
+        </div>
+      </Surface>
+      <div className="root-cause-list">
+        {hypotheses.map((hypothesis) => <Surface key={hypothesis.key} title={hypothesis.title} kicker={`${hypothesis.confidence_label} · hypothesis, not a confirmed cause`}>
+          <div className="surface-body root-cause-body">
+            <div className="root-cause-score">
+              <strong>{Math.round(hypothesis.confidence_score * 100)}% heuristic evidence support</strong>
+              <div className="ai-score-track"><div style={{ width: `${Math.round(hypothesis.confidence_score * 100)}%` }} /></div>
+              <span>Not a statistically calibrated probability</span>
+            </div>
+            <p className="detail-summary">{hypothesis.explanation}</p>
+            <div className="root-cause-subsection"><h3>Supporting evidence</h3>{citations(hypothesis.supporting_evidence_ids ?? hypothesis.evidence_ids)}</div>
+            <div className="root-cause-subsection"><h3>Contradicting evidence</h3>{hypothesis.contradicting_evidence_ids?.length
+              ? citations(hypothesis.contradicting_evidence_ids)
+              : <p className="ai-muted">No direct contradicting record was identified in the retrieved evidence; absence of contradiction is not confirmation.</p>}</div>
+            <div className="root-cause-subsection"><h3>Evidence still missing</h3>
+              {hypothesis.missing_evidence?.length
+                ? <ul>{hypothesis.missing_evidence.map((item) => <li key={item}>{item}</li>)}</ul>
+                : <p className="ai-muted">{hypothesis.uncertainty}</p>}
+            </div>
+            <div className="root-cause-subsection"><h3>Next validation test</h3><p>{hypothesis.test}</p></div>
+          </div>
+        </Surface>)}
+      </div>
+      <Surface title="Scoring method and alternatives" kicker="Transparent heuristic">
+        <div className="surface-body">
+          <p className="detail-summary">{report.support_score_method}</p>
+          <p className="ai-muted">{report.support_score_note}</p>
+          <p className="ai-muted">Alternatives remain visible above rather than being discarded. Gather the missing time-aligned records before choosing one cause.</p>
+        </div>
+      </Surface>
+      {renderEvidenceDetail()}
+    </div>;
   }
 
   function renderRemediation() {
@@ -486,6 +739,7 @@ export default function App() {
           () => void runCheckoutAIInvestigation(),
           aiActionLoading,
           checkoutAIInvestigation.run_number !== checkoutMetrics.run_number,
+          "checkout",
         )
         : <Surface title="Agent investigation" kicker="Evidence-first · saved to SQLite">
           <div className="surface-body">
@@ -506,16 +760,22 @@ export default function App() {
     </article>;
   }
 
-  function renderAIInvestigation(report: AIInvestigation, onRun: () => void, busy: boolean, staleRun = false) {
+  function renderAIInvestigation(
+    report: AIInvestigation,
+    onRun: () => void,
+    busy: boolean,
+    staleRun = false,
+    evidenceScopeForReport: "incident" | "checkout" = report.scope === "checkout_simulation" ? "checkout" : "incident",
+  ) {
     const evidenceById = new Map(report.evidence.map((item) => [item.id, item]));
     const citations = (ids: string[]) => ids.length ? <div className="ai-citations">
       {ids.map((id) => {
         const item = evidenceById.get(id);
-        return <div className="ai-citation" key={id}>
+        return <button className="ai-citation" key={id} disabled={!item} onClick={() => void openStoredEvidence(id, evidenceScopeForReport)}>
           <strong>{item?.source ?? id}</strong>
           <span>{item?.text ?? "Source record unavailable."}</span>
           {item?.observed_at && <small>{new Date(item.observed_at).toLocaleString()}</small>}
-        </div>;
+        </button>;
       })}
     </div> : <div className="ai-muted">No supporting records were available.</div>;
 
@@ -610,6 +870,7 @@ export default function App() {
           </section>
         </div>
       </div>
+      {renderEvidenceDetail()}
     </Surface>;
   }
 
@@ -679,6 +940,7 @@ export default function App() {
       </div>;
     }
     if (section === "Evidence Chain") return renderEvidence();
+    if (section === "Root Cause") return renderRootCause();
     if (section === "Services & Metrics") return renderServices();
     if (section === "Checkout Simulation") return renderCheckoutSimulation();
     if (section === "Knowledge Base") return <KnowledgeBasePage />;

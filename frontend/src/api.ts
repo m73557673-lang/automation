@@ -227,12 +227,38 @@ export type AIInvestigationHypothesis = {
   explanation: string;
   test: string;
   evidence_ids: string[];
+  supporting_evidence_ids?: string[];
+  contradicting_evidence_ids?: string[];
+  missing_evidence?: string[];
   confidence_score: number;
   confidence_label: string;
   uncertainty: string;
   origin: string;
   ai_selected?: boolean;
   ai_evidence_ids?: string[];
+};
+
+export type AIInvestigationEvidence = {
+  id: string;
+  source_ref?: string;
+  source_type?: string;
+  source: string;
+  kind: string;
+  text: string;
+  excerpt?: string;
+  value?: number | string | null;
+  observed_at: string | null;
+  record_class?: string;
+};
+
+export type StoredEvidenceDetail = {
+  id: string;
+  source_type: string;
+  source_reference: string;
+  timestamp: string | null;
+  source: string;
+  excerpt: string;
+  value: number | string | null;
 };
 
 export type AIInvestigation = {
@@ -274,7 +300,7 @@ export type AIInvestigation = {
   }[];
   support_score_method: string;
   support_score_note: string;
-  evidence: { id: string; source: string; kind: string; text: string; observed_at: string | null }[];
+  evidence: AIInvestigationEvidence[];
   safety: string;
 };
 
@@ -345,9 +371,13 @@ function toRemediation(action: {
 export const api = {
   health: () => request<{ status: string; database: string }>("/health"),
   aiInvestigation: (id: number) => optional<AIInvestigation>(`/incidents/${id}/ai-investigation`),
+  incidentAIEvidence: (id: number, ref: string) =>
+    request<StoredEvidenceDetail>(`/incidents/${id}/ai-evidence?ref=${encodeURIComponent(ref)}`),
   runAIInvestigation: (id: number) =>
     request<AIInvestigation>(`/incidents/${id}/ai-investigation`, { method: "POST" }),
   checkoutAIInvestigation: () => optional<AIInvestigation>("/simulation/ai-investigation"),
+  checkoutAIEvidence: (ref: string) =>
+    request<StoredEvidenceDetail>(`/simulation/ai-evidence?ref=${encodeURIComponent(ref)}`),
   runCheckoutAIInvestigation: () =>
     request<AIInvestigation>("/simulation/ai-investigation", { method: "POST" }),
   checkoutSimulation: () => request<CheckoutSimulationMetrics>("/simulation/metrics"),

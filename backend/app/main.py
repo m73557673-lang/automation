@@ -18,6 +18,7 @@ from .models import (
     Evidence,
     Incident,
     KnowledgeDocument,
+    LogEvent,
     Metric,
     OperationalDocument,
     OperationalDocumentChunk,
@@ -69,6 +70,7 @@ from .services.ai_investigation import (
     run_incident_investigation,
 )
 from .services.checkout_simulation import (
+    CHECKOUT_ENVIRONMENT,
     get_checkout_events,
     get_checkout_health,
     get_checkout_metrics,
@@ -116,6 +118,104 @@ def _incident_or_404(db: Session, incident_id: int) -> Incident:
     if incident is None:
         raise HTTPException(status_code=404, detail="Incident not found.")
     return incident
+
+
+def _resolve_saved_ai_evidence(
+    db: Session,
+    *,
+    scope: str,
+    ref: str,
+    incident: Incident | None = None,
+) -> dict:
+    report = latest_investigation(db, scope)
+    if report is None or not any(item.get("id") == ref for item in report.get("evidence", [])):
+        raise HTTPException(status_code=404, detail="Evidence is not part of the saved investigation.")
+
+    parts = ref.split(":")
+    kind = parts[0]
+    detail = None
+    if kind in {"log", "metric", "deployment"} and len(parts) == 2 and parts[1].isdigit():
+        record_id = int(parts[1])
+        model = {"log": LogEvent, "metric": Metric, "deployment": Deployment}[kind]
+        record = db.get(model, record_id)
+        if record is not None:
+            service = record.service
+            allowed = (
+                service.id == incident.service_id
+                if incident is not None
+                else service.environment == CHECKOUT_ENVIRONMENT
+            )
+            if allowed:
+                if kind == "log":
+                    excerpt = record.message
+                    value = None
+                    timestamp = record.timestamp
+                    source = f"{service.name} · {record.level}"
+                    reference = f"log:{record.id}"
+                    source_type = "application_log"
+                elif kind == "metric":
+                    excerpt = f"{record.metric_name} = {record.value:g}"
+                    value = record.value
+                    timestamp = record.timestamp
+                    source = service.name
+                    reference = f"metric:{record.id}"
+                    source_type = "metric"
+                else:
+                    excerpt = record.changes
+                    value = record.version
+                    timestamp = record.timestamp
+                    source = service.name
+                    reference = f"deployment:{record.id}"
+                    source_type = "deployment_or_configuration"
+                detail = {
+                    "id": ref,
+                    "source_type": source_type,
+                    "source_reference": reference,
+                    "timestamp": timestamp,
+                    "source": source,
+                    "excerpt": excerpt,
+                    "value": value,
+                }
+    elif kind == "historical_incident" and len(parts) == 2 and parts[1].isdigit():
+        record = db.get(Incident, int(parts[1]))
+        if record is not None and record.id != (incident.id if incident else None):
+            allowed = (
+                record.service_id == incident.service_id
+                if incident is not None
+                else record.service.environment == CHECKOUT_ENVIRONMENT
+            )
+            if allowed:
+                detail = {
+                    "id": ref,
+                    "source_type": "historical_incident",
+                    "source_reference": f"incident:{record.id}",
+                    "timestamp": record.created_at,
+                    "source": record.service.name,
+                    "excerpt": f"{record.title} · severity {record.severity} · status {record.status}",
+                    "value": None,
+                }
+    elif kind == "knowledge" and len(parts) == 3 and parts[1].isdigit() and parts[2].isdigit():
+        pair = retrieve_chunk(db, int(parts[1]), int(parts[2]))
+        if pair is not None:
+            document, chunk = pair
+            detail = {
+                "id": ref,
+                "source_type": (
+                    "historical_incident"
+                    if "incident" in document.title.lower() else "runbook_excerpt"
+                ),
+                "source_reference": (
+                    f"operational_document:{document.id}#chunk:{chunk.chunk_index}"
+                ),
+                "timestamp": None,
+                "source": f"{document.title} · {document.source}",
+                "excerpt": chunk.content,
+                "value": None,
+            }
+
+    if detail is None:
+        raise HTTPException(status_code=404, detail="The original stored evidence record is unavailable.")
+    return detail
 
 
 _DEFAULT_AI_PROVIDER = object()
@@ -219,6 +319,12 @@ def create_app(
         if result is None:
             raise HTTPException(status_code=404, detail="No AI investigation has been recorded for the checkout simulation.")
         return result
+
+    @router.get("/simulation/ai-evidence")
+    def get_checkout_ai_evidence(ref: str = Query(min_length=3, max_length=120), db: Session = Depends(get_db)):
+        return _resolve_saved_ai_evidence(
+            db, scope="checkout_simulation", ref=ref
+        )
 
     @router.post("/simulation/ai-investigation")
     def investigate_checkout_with_agents(db: Session = Depends(get_db)):
@@ -375,6 +481,17 @@ def create_app(
                 raise HTTPException(status_code=404, detail="Incident not found.")
             raise HTTPException(status_code=404, detail="No AI investigation has been recorded for this incident.")
         return result
+
+    @router.get("/incidents/{incident_id}/ai-evidence")
+    def get_incident_ai_evidence(
+        incident_id: int,
+        ref: str = Query(min_length=3, max_length=120),
+        db: Session = Depends(get_db),
+    ):
+        incident = _incident_or_404(db, incident_id)
+        return _resolve_saved_ai_evidence(
+            db, scope=f"incident:{incident_id}", ref=ref, incident=incident
+        )
 
     @router.post("/incidents/{incident_id}/ai-investigation")
     def investigate_incident_with_agents(incident_id: int, db: Session = Depends(get_db)):

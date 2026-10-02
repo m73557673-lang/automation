@@ -237,11 +237,20 @@ def _evidence(
     observed_at: datetime | None,
     record_class: str = "direct",
 ) -> dict:
+    numeric_value = None
+    if kind == "metric":
+        match = re.search(r"=(-?\d+(?:\.\d+)?)$", text)
+        if match:
+            numeric_value = float(match.group(1))
     return {
         "id": ref,
+        "source_ref": ref,
+        "source_type": kind,
         "source": source,
         "kind": kind,
         "text": text,
+        "excerpt": text,
+        "value": numeric_value,
         "observed_at": _stamp(observed_at),
         "record_class": record_class,
     }
@@ -353,7 +362,7 @@ def _incident_context(db: Session, incident_id: int, embedding_provider) -> dict
 
     query = f"{incident.title} {incident.service.name} {incident.severity} timeout deployment database checkout"
     mode, passages, retrieval_warning = _passages(db, query, embedding_provider)
-    evidence.extend(_knowledge_evidence(passages))
+    evidence.extend(_knowledge_evidence(db, passages))
     context = {
         "scope": f"incident:{incident.id}",
         "title": incident.title,
@@ -371,14 +380,22 @@ def _incident_context(db: Session, incident_id: int, embedding_provider) -> dict
     return _build_analysis_context(context)
 
 
-def _knowledge_evidence(passages: list[dict]) -> list[dict]:
+def _knowledge_evidence(db: Session, passages: list[dict]) -> list[dict]:
+    documents = {
+        item["document_id"]: db.get(OperationalDocument, item["document_id"])
+        for item in passages
+    }
     return [
         _evidence(
             ref=f"knowledge:{item['document_id']}:{item['chunk_index']}",
             source=f"{item['title']} · {item['source']}",
             kind="knowledge",
             text=item["excerpt"],
-            observed_at=None,
+            observed_at=(
+                documents[item["document_id"]].indexed_at
+                or documents[item["document_id"]].created_at
+                if documents.get(item["document_id"]) else None
+            ),
             record_class="historical" if "incident" in item["title"].lower() else "reference",
         )
         for item in passages
@@ -414,7 +431,7 @@ def _checkout_context(db: Session, embedding_provider) -> dict:
         "increased traffic historical incident INC-873 troubleshooting"
     )
     mode, passages, retrieval_warning = _passages(db, query, embedding_provider)
-    evidence.extend(_knowledge_evidence(passages))
+    evidence.extend(_knowledge_evidence(db, passages))
     return _build_analysis_context({
         "scope": "checkout_simulation",
         "title": "Synthetic checkout simulation",
@@ -608,11 +625,16 @@ def _hypotheses(context: dict) -> list[dict]:
             "key": "pool_reduction",
             "title": "A smaller database connection pool contributed to checkout failures",
             "test": "Compare the deployment configuration with pool-size, utilization, and acquisition-wait samples.",
-            "fact_ids": (["pool_size_change"] if pool else [])
+            "fact_ids": (["pool_size_change"] if pool and pool["value"]["changed"] else [])
                 + (["pool_utilization"] if utilization else [])
                 + (["timeout_frequency"] if timeouts else [])
                 + (["troubleshooting_documentation"] if docs else []),
-            "contradiction": bool(pool and not pool["value"]["changed"]),
+            "contradiction_fact_ids": (
+                ["pool_size_change"] if pool and not pool["value"]["changed"] else []
+            ),
+            "missing_evidence": [
+                "Timestamp-aligned connection-acquisition waits and active/idle session counts."
+            ],
             "uncertainty": (
                 "The sampled pool size stayed constant; a pool reduction is not supported by these samples."
                 if pool and not pool["value"]["changed"] else
@@ -623,11 +645,16 @@ def _hypotheses(context: dict) -> list[dict]:
             "key": "traffic_surge",
             "title": "Higher checkout traffic increased database contention",
             "test": "Compare request-rate and connection-wait changes over the same timestamps; inspect query duration.",
-            "fact_ids": (["checkout_traffic"] if traffic else [])
+            "fact_ids": (["checkout_traffic"] if traffic and traffic["value"]["increased"] else [])
                 + (["pool_utilization"] if utilization else [])
                 + (["timeout_frequency"] if timeouts else [])
                 + (["troubleshooting_documentation"] if docs else []),
-            "contradiction": bool(traffic and not traffic["value"]["increased"]),
+            "contradiction_fact_ids": (
+                ["checkout_traffic"] if traffic and not traffic["value"]["increased"] else []
+            ),
+            "missing_evidence": [
+                "Timestamp-aligned request volume and database contention measurements."
+            ],
             "uncertainty": (
                 "The sampled request rate did not reach 1.5× its baseline."
                 if traffic and not traffic["value"]["increased"] else
@@ -642,7 +669,10 @@ def _hypotheses(context: dict) -> list[dict]:
                 + (["pool_utilization"] if utilization else [])
                 + (["historical_incident"] if historical else [])
                 + (["troubleshooting_documentation"] if docs else []),
-            "contradiction": False,
+            "contradiction_fact_ids": [],
+            "missing_evidence": [
+                "Query-duration, active/idle database-session, and acquisition-wait samples."
+            ],
             "uncertainty": "Query-duration and session-level samples are not present, so this cause remains unverified.",
         },
     ]
@@ -650,8 +680,14 @@ def _hypotheses(context: dict) -> list[dict]:
     results = []
     for item in definitions:
         fact_records = [facts[key] for key in item["fact_ids"] if key in facts]
+        contradiction_records = [
+            facts[key] for key in item["contradiction_fact_ids"] if key in facts
+        ]
         refs = list(dict.fromkeys(
             ref for fact in fact_records for ref in fact["evidence_ids"]
+        ))
+        contradiction_refs = list(dict.fromkeys(
+            ref for fact in contradiction_records for ref in fact["evidence_ids"]
         ))
         # Count each independent source once. A historical/runbook passage is
         # corroboration, not equivalent to a direct metric/log/deployment record.
@@ -664,25 +700,39 @@ def _hypotheses(context: dict) -> list[dict]:
             if evidence.get(ref, {}).get("kind") in {"knowledge", "historical_incident"}
         }
         support = len(direct) * 2 + len(corroborating)
-        contradiction = 2 if item["contradiction"] else 0
+        contradiction = sum(
+            2 if evidence.get(ref, {}).get("kind") in {"metric", "log", "deployment"} else 1
+            for ref in contradiction_refs
+        )
         score = support / (support + contradiction + 2) if support else 0.0
+        explanation_parts = []
+        if fact_records:
+            explanation_parts.append(
+                "Supporting records: " + " ".join(fact["statement"] for fact in fact_records)
+            )
+        else:
+            explanation_parts.append("No direct record currently supports this explanation.")
+        if contradiction_records:
+            explanation_parts.append(
+                "Counter-evidence: "
+                + " ".join(fact["statement"] for fact in contradiction_records)
+            )
         results.append({
             "key": item["key"],
             "title": item["title"],
-            "explanation": (
-                "Candidate explanation assembled from the cited records; correlation is not causation."
-            ),
+            "explanation": " ".join(explanation_parts),
             "test": item["test"],
             "evidence_ids": refs,
+            "supporting_evidence_ids": refs,
+            "contradicting_evidence_ids": contradiction_refs,
             "confidence_score": round(score, 4),
             "confidence_label": (
                 "strong evidence support" if score >= 0.7 else
                 "some evidence support" if score >= 0.4 else
                 "limited or conflicting evidence"
             ),
-            "uncertainty": item["uncertainty"] if refs else (
-                "No relevant direct evidence was collected for this explanation."
-            ),
+            "uncertainty": item["uncertainty"],
+            "missing_evidence": item["missing_evidence"],
             "support_points": support,
             "contradiction_points": contradiction,
             "origin": "deterministic evidence synthesis",
