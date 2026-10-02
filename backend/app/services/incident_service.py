@@ -116,7 +116,8 @@ INCIDENT_FIXTURES = [
 
 
 def _is_synthetic(service: Service) -> bool:
-    return service.environment.casefold() in {"simulation", "simulated", "synthetic", "demo"}
+    environment = service.environment.casefold()
+    return environment in {"simulation", "simulated", "synthetic", "demo"} or environment.startswith("synthetic-")
 
 
 def serialize_service(db: Session, service: Service) -> dict:

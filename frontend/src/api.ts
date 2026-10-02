@@ -99,6 +99,69 @@ export type Dashboard = {
   synthetic: boolean;
 };
 
+export type CheckoutMetricPoint = {
+  timestamp: string;
+  latency_ms: number | null;
+  error_rate_percent: number | null;
+  request_volume_rps: number | null;
+  db_pool_utilization_percent: number | null;
+  db_pool_size: number | null;
+};
+
+export type CheckoutServiceMetrics = {
+  service_id: number;
+  name: string;
+  status: string;
+  latency_ms: number | null;
+  error_rate_percent: number | null;
+  request_volume_rps: number | null;
+  db_pool_utilization_percent: number | null;
+  db_pool_size: number | null;
+  history: CheckoutMetricPoint[];
+  is_synthetic: boolean;
+};
+
+export type CheckoutSimulationMetrics = {
+  state: "healthy" | "incident";
+  run_number: number;
+  updated_at: string;
+  services: CheckoutServiceMetrics[];
+  is_synthetic: boolean;
+};
+
+export type CheckoutServiceHealth = {
+  name: string;
+  status: string;
+  summary: string;
+  latency_ms: number | null;
+  error_rate_percent: number | null;
+  db_pool_utilization_percent: number | null;
+  is_synthetic: boolean;
+};
+
+export type CheckoutSimulationHealth = {
+  state: "healthy" | "incident";
+  overall_status: "healthy" | "degraded";
+  services: CheckoutServiceHealth[];
+  is_synthetic: boolean;
+};
+
+export type CheckoutSimulationEvent = {
+  id: string;
+  timestamp: string;
+  kind: "log" | "deployment";
+  level: string;
+  service: string;
+  title: string;
+  detail: string;
+  is_synthetic: boolean;
+};
+
+export type CheckoutSimulationEvents = {
+  items: CheckoutSimulationEvent[];
+  is_synthetic: boolean;
+};
+
 export type Investigation = {
   incident: Incident;
   evidence: Evidence[];
@@ -172,6 +235,13 @@ function toRemediation(action: {
 
 export const api = {
   health: () => request<{ status: string; database: string }>("/health"),
+  checkoutSimulation: () => request<CheckoutSimulationMetrics>("/simulation/metrics"),
+  checkoutSimulationHealth: () => request<CheckoutSimulationHealth>("/simulation/health"),
+  checkoutSimulationEvents: () => request<CheckoutSimulationEvents>("/simulation/events"),
+  startCheckoutSimulation: () =>
+    request<CheckoutSimulationMetrics>("/simulation/start", { method: "POST" }),
+  resetCheckoutSimulation: () =>
+    request<CheckoutSimulationMetrics>("/simulation/reset", { method: "POST" }),
   dashboard: () => request<Dashboard>("/dashboard"),
   incidents: () => pageItems<Incident>("/incidents?skip=0&limit=100"),
   createIncident: (data: {

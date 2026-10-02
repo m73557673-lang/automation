@@ -8,7 +8,7 @@ from sqlalchemy.orm import sessionmaker
 
 from app.database import create_sqlite_engine, get_db, initialize_database
 from app.main import create_app
-from app.models import Action, Incident, Metric, Service
+from app.models import Action, Deployment, Incident, LogEvent, Metric, Service
 
 
 @pytest.fixture
@@ -38,7 +38,7 @@ def test_health_and_paginated_collections_are_available_at_both_prefixes(test_ap
 
     services = client.get("/services?skip=1&limit=2")
     assert services.status_code == 200
-    assert services.json()["total"] == 4
+    assert services.json()["total"] == 8
     assert len(services.json()["items"]) == 2
     assert services.json()["skip"] == 1
 
@@ -204,3 +204,99 @@ def test_legacy_sqlite_data_is_archived_and_migrated_without_loss(tmp_path):
             assert "services" in names and "incidents" in names
     finally:
         db_engine.dispose()
+
+
+def test_checkout_simulation_is_synthetic_reproducible_and_resettable(test_app):
+    client, factory = test_app
+
+    baseline = client.get("/api/simulation/metrics")
+    assert baseline.status_code == 200
+    assert baseline.json()["state"] == "healthy"
+    assert baseline.json()["is_synthetic"] is True
+    assert len(baseline.json()["services"]) == 4
+    assert all(service["is_synthetic"] for service in baseline.json()["services"])
+    assert client.get("/api/simulation/health").json()["overall_status"] == "healthy"
+    baseline_by_name = {service["name"]: service for service in baseline.json()["services"]}
+    assert baseline_by_name["Checkout Service"]["latency_ms"] < 150
+    assert baseline_by_name["Checkout Service"]["error_rate_percent"] < 1
+    assert baseline_by_name["Database Service"]["db_pool_size"] == 50
+    assert baseline_by_name["Database Service"]["db_pool_utilization_percent"] < 50
+    assert all(
+        service["history"][-1]["timestamp"]
+        and max(point["latency_ms"] for point in service["history"])
+        - min(point["latency_ms"] for point in service["history"]) < 5
+        for service in baseline.json()["services"]
+    )
+
+    first_run = client.post("/api/simulation/start")
+    assert first_run.status_code == 200
+    first = first_run.json()
+    assert first["state"] == "incident"
+    assert first["run_number"] == 1
+    by_name = {service["name"]: service for service in first["services"]}
+    assert by_name["Database Service"]["db_pool_size"] == 10
+    assert by_name["Database Service"]["db_pool_utilization_percent"] == 100
+    assert by_name["Checkout Service"]["latency_ms"] == 2100
+    assert by_name["Checkout Service"]["error_rate_percent"] == 16
+    assert by_name["API Gateway"]["request_volume_rps"] > 2 * 240
+
+    health = client.get("/api/simulation/health").json()
+    assert health["overall_status"] == "degraded"
+    assert all(service["status"] == "Degraded" for service in health["services"])
+
+    events = client.get("/api/simulation/events").json()
+    assert events["is_synthetic"] is True
+    assert any(event["kind"] == "deployment" for event in events["items"])
+    assert any("DB_POOL_SIZE changed from 50 to 10" in event["detail"] for event in events["items"])
+    assert any("timeout" in event["detail"].lower() for event in events["items"])
+    assert all(event["timestamp"] and event["is_synthetic"] for event in events["items"])
+    assert len(events["items"]) == 8
+    event_times = [datetime.fromisoformat(event["timestamp"]) for event in events["items"]]
+    assert event_times == sorted(event_times, reverse=True)
+
+    second = client.post("/api/simulation/start").json()
+    assert second["run_number"] == 2
+    for first_service, second_service in zip(first["services"], second["services"]):
+        assert first_service["name"] == second_service["name"]
+        assert [
+            {key: value for key, value in point.items() if key != "timestamp"}
+            for point in first_service["history"]
+        ] == [
+            {key: value for key, value in point.items() if key != "timestamp"}
+            for point in second_service["history"]
+        ]
+    second_events = client.get("/api/simulation/events").json()["items"]
+    assert [
+        (event["kind"], event["level"], event["service"], event["title"], event["detail"])
+        for event in events["items"]
+    ] == [
+        (event["kind"], event["level"], event["service"], event["title"], event["detail"])
+        for event in second_events
+    ]
+
+    with factory() as db:
+        checkout_service = db.scalar(select(Service).where(Service.name == "Checkout Service"))
+        assert checkout_service is not None
+        stored_metrics = db.scalar(
+            select(func.count()).select_from(Metric).where(Metric.service_id == checkout_service.id)
+        )
+        assert stored_metrics == 21
+        database_service = db.scalar(select(Service).where(Service.name == "Database Service"))
+        assert database_service is not None
+        assert db.scalar(
+            select(func.count()).select_from(Deployment).where(Deployment.service_id == database_service.id)
+        ) == 1
+        assert db.scalar(
+            select(func.count()).select_from(LogEvent).where(LogEvent.service_id == database_service.id)
+        ) == 2
+
+    reset = client.post("/api/simulation/reset")
+    assert reset.status_code == 200
+    assert reset.json()["state"] == "healthy"
+    assert reset.json()["run_number"] == 2
+    assert client.get("/api/simulation/health").json()["overall_status"] == "healthy"
+    restored = {service["name"]: service for service in reset.json()["services"]}
+    assert restored["Database Service"]["db_pool_size"] == 50
+    assert restored["Database Service"]["db_pool_utilization_percent"] < 50
+    assert restored["Checkout Service"]["error_rate_percent"] < 1
+    assert client.get("/api/simulation/events").json()["is_synthetic"] is True

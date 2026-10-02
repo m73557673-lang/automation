@@ -111,6 +111,18 @@ class Metric(Base):
     service: Mapped[Service] = relationship(back_populates="metrics")
 
 
+class CheckoutSimulationState(Base):
+    __tablename__ = "checkout_simulation_state"
+    __table_args__ = (
+        CheckConstraint("state IN ('healthy', 'incident')", name="ck_checkout_simulation_state"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    state: Mapped[str] = mapped_column(String(16), default="healthy", nullable=False)
+    run_number: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+
 class KnowledgeDocument(Base):
     __tablename__ = "knowledge_documents"
     __table_args__ = (Index("ix_knowledge_documents_type_title", "type", "title"),)

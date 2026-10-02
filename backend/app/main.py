@@ -60,6 +60,14 @@ from .services.incident_service import (
     serialize_remediation,
     serialize_service,
 )
+from .services.checkout_simulation import (
+    get_checkout_events,
+    get_checkout_health,
+    get_checkout_metrics,
+    initialize_checkout_simulation,
+    reset_checkout_simulation,
+    start_checkout_simulation,
+)
 
 
 class JsonFormatter(logging.Formatter):
@@ -96,6 +104,7 @@ def create_app(database_engine: Engine = engine) -> FastAPI:
         factory = sessionmaker(bind=database_engine, autoflush=False, expire_on_commit=False)
         with factory() as db:
             seed_database(db)
+            initialize_checkout_simulation(db)
         logger.info("normalized SQLite database initialized")
         yield
 
@@ -145,6 +154,35 @@ def create_app(database_engine: Engine = engine) -> FastAPI:
     def health(db: Session = Depends(get_db)):
         db.execute(text("SELECT 1"))
         return {"status": "ok", "database": "connected"}
+
+    @router.post("/simulation/start")
+    def start_checkout_demo(db: Session = Depends(get_db)):
+        try:
+            return start_checkout_simulation(db)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @router.get("/simulation/metrics")
+    def checkout_demo_metrics(db: Session = Depends(get_db)):
+        return get_checkout_metrics(db)
+
+    @router.get("/simulation/health")
+    def checkout_demo_health(db: Session = Depends(get_db)):
+        return get_checkout_health(db)
+
+    @router.get("/simulation/events")
+    def checkout_demo_events(
+        limit: int = Query(default=100, ge=1, le=200),
+        db: Session = Depends(get_db),
+    ):
+        return get_checkout_events(db, limit)
+
+    @router.post("/simulation/reset")
+    def reset_checkout_demo(db: Session = Depends(get_db)):
+        try:
+            return reset_checkout_simulation(db)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @router.get("/dashboard", response_model=DashboardOut)
     def dashboard(db: Session = Depends(get_db)):

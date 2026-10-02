@@ -2,20 +2,21 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Activity, AlertTriangle, ArrowRight, BookOpen, Check, CheckCircle2, ChevronRight,
   CircleHelp, Command, FileText, Filter, GitBranch, ListChecks, LoaderCircle,
-  Plus, RefreshCw, Search, Server, Settings2, ShieldCheck, Sparkles, X,
+  Plus, RefreshCw, Search, Server, Settings2, ShieldCheck, ShoppingCart, Sparkles, X,
 } from "lucide-react";
 import {
-  Area, AreaChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis,
+  Area, AreaChart, CartesianGrid, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis,
 } from "recharts";
-import { api, type Dashboard, type Incident, type Investigation, type Postmortem, type Remediation, type Runbook, type Service } from "./api";
+import { api, type CheckoutSimulationEvents, type CheckoutSimulationHealth, type CheckoutSimulationMetrics, type Dashboard, type Incident, type Investigation, type Postmortem, type Remediation, type Runbook, type Service } from "./api";
 
-type Section = "Overview" | "Incidents" | "Investigation" | "Evidence Chain" | "Services & Metrics" | "Knowledge Base" | "Remediation" | "Postmortems" | "Settings";
+type Section = "Overview" | "Incidents" | "Investigation" | "Evidence Chain" | "Services & Metrics" | "Checkout Simulation" | "Knowledge Base" | "Remediation" | "Postmortems" | "Settings";
 const sections: { label: Section; icon: typeof Activity }[] = [
   { label: "Overview", icon: Activity },
   { label: "Incidents", icon: AlertTriangle },
   { label: "Investigation", icon: Search },
   { label: "Evidence Chain", icon: GitBranch },
   { label: "Services & Metrics", icon: Server },
+  { label: "Checkout Simulation", icon: ShoppingCart },
   { label: "Knowledge Base", icon: BookOpen },
   { label: "Remediation", icon: ListChecks },
   { label: "Postmortems", icon: FileText },
@@ -27,6 +28,7 @@ const sectionCopy: Record<Section, [string, string]> = {
   Investigation: ["Investigation", "Correlate the evidence trail and consult relevant runbooks."],
   "Evidence Chain": ["Evidence chain", "A traceable sequence of synthetic signals supporting the investigation."],
   "Services & Metrics": ["Services & metrics", "Scenario metric histories. These charts are simulated, not production telemetry."],
+  "Checkout Simulation": ["Checkout simulation", "Practice checkout incident response against deterministic, synthetic service signals."],
   "Knowledge Base": ["Knowledge base", "Search operational guidance for the selected service and scenario."],
   Remediation: ["Remediation review", "Explicit operator approval is required before any simulated action is recorded."],
   Postmortems: ["Postmortems", "Generate and review clearly labeled synthetic incident narratives."],
@@ -82,6 +84,12 @@ export default function App() {
   const [createOpen, setCreateOpen] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [actionLoading, setActionLoading] = useState(false);
+  const [checkoutMetrics, setCheckoutMetrics] = useState<CheckoutSimulationMetrics | null>(null);
+  const [checkoutHealth, setCheckoutHealth] = useState<CheckoutSimulationHealth | null>(null);
+  const [checkoutEvents, setCheckoutEvents] = useState<CheckoutSimulationEvents | null>(null);
+  const [checkoutLoading, setCheckoutLoading] = useState(false);
+  const [checkoutActionLoading, setCheckoutActionLoading] = useState(false);
+  const checkoutRequested = useRef(false);
   const selectedIdRef = useRef<number | null>(selectedId);
   selectedIdRef.current = selectedId;
 
@@ -122,6 +130,30 @@ export default function App() {
   }, []);
 
   useEffect(() => { void load(); }, [load]);
+
+  const loadCheckout = useCallback(async () => {
+    setCheckoutLoading(true);
+    setError("");
+    const results = await Promise.allSettled([
+      api.checkoutSimulation(), api.checkoutSimulationHealth(), api.checkoutSimulationEvents(),
+    ]);
+    let failed = "";
+    if (results[0].status === "fulfilled") setCheckoutMetrics(results[0].value);
+    else failed ||= `Could not load checkout metrics: ${results[0].reason instanceof Error ? results[0].reason.message : "Request failed"}`;
+    if (results[1].status === "fulfilled") setCheckoutHealth(results[1].value);
+    else failed ||= `Could not load checkout health: ${results[1].reason instanceof Error ? results[1].reason.message : "Request failed"}`;
+    if (results[2].status === "fulfilled") setCheckoutEvents(results[2].value);
+    else failed ||= `Could not load checkout events: ${results[2].reason instanceof Error ? results[2].reason.message : "Request failed"}`;
+    setError(failed);
+    setCheckoutLoading(false);
+  }, []);
+
+  useEffect(() => {
+    if (section === "Checkout Simulation" && !checkoutRequested.current) {
+      checkoutRequested.current = true;
+      void loadCheckout();
+    }
+  }, [section, loadCheckout]);
 
   const selectIncident = useCallback(async (id: number) => {
     setSelectedId(id);
@@ -186,6 +218,33 @@ export default function App() {
     try { setRunbooks(await api.knowledge(knowledgeQuery)); }
     catch (reason) { setError(reason instanceof Error ? reason.message : "Could not search the knowledge base."); }
     finally { setKnowledgeLoading(false); }
+  }
+
+  async function startCheckoutIncident() {
+    setCheckoutActionLoading(true);
+    setError("");
+    try {
+      setCheckoutMetrics(await api.startCheckoutSimulation());
+      await loadCheckout();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Could not start the checkout incident simulation.");
+    } finally {
+      setCheckoutActionLoading(false);
+    }
+  }
+
+  async function resetCheckoutSimulation() {
+    if (!window.confirm("Reset the checkout simulation to its healthy state? This affects the simulation only; no live infrastructure is connected.")) return;
+    setCheckoutActionLoading(true);
+    setError("");
+    try {
+      setCheckoutMetrics(await api.resetCheckoutSimulation());
+      await loadCheckout();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Could not reset the checkout simulation.");
+    } finally {
+      setCheckoutActionLoading(false);
+    }
   }
 
   async function generatePostmortem() {
@@ -289,6 +348,118 @@ export default function App() {
     })}</div>;
   }
 
+  function renderCheckoutSimulation() {
+    if (checkoutLoading && !checkoutMetrics) return <LoadingState />;
+    if (!checkoutMetrics) return <EmptyState title="Checkout simulation unavailable" detail="Retry to load the deterministic checkout scenario from the simulation API." icon={AlertTriangle} />;
+    const events = [...(checkoutEvents?.items ?? [])].sort((a, b) => Date.parse(a.timestamp) - Date.parse(b.timestamp));
+    const metricsToChart = [
+      { key: "latency_ms", label: "Latency", unit: "ms", color: "#64d7e7" },
+      { key: "error_rate_percent", label: "Error rate", unit: "%", color: "#f18d91" },
+      { key: "request_volume_rps", label: "Request volume", unit: "rps", color: "#75a9f7" },
+      { key: "db_pool_utilization_percent", label: "DB pool utilization", unit: "%", color: "#e9bd72" },
+      { key: "db_pool_size", label: "DB pool size", unit: " connections", color: "#a9a0dc" },
+    ] as const;
+    const formatValue = (value: number | null, unit: string) => value === null
+      ? "—"
+      : `${Number.isInteger(value) ? value : value.toFixed(1)}${unit}`;
+    return <>
+      <section className="checkout-command surface" aria-label="Checkout simulation controls">
+        <div className="checkout-command-top">
+          <div>
+            <div className="checkout-state-row">
+              <span className={`checkout-state ${checkoutMetrics.state}`}>{checkoutMetrics.state === "incident" ? "Incident active" : "Healthy"}</span>
+              <span className="checkout-health-copy">Overall health <Status value={checkoutHealth?.overall_status ?? "unavailable"} /></span>
+            </div>
+            <div className="checkout-run-meta">RUN {String(checkoutMetrics.run_number).padStart(2, "0")} <span>·</span> UPDATED {new Date(checkoutMetrics.updated_at).toLocaleString()}</div>
+          </div>
+          <div className="action-row checkout-actions">
+            <button className="button primary" onClick={() => void startCheckoutIncident()} disabled={checkoutActionLoading || checkoutMetrics.state === "incident"}>
+              {checkoutActionLoading ? <LoaderCircle size={14} /> : <AlertTriangle size={14} />}
+              {checkoutActionLoading ? "Applying…" : checkoutMetrics.state === "incident" ? "Incident already active" : "Start incident"}
+            </button>
+            <button className="button" onClick={() => void resetCheckoutSimulation()} disabled={checkoutActionLoading}>
+              {checkoutActionLoading ? <LoaderCircle size={14} /> : <RefreshCw size={14} />}
+              Reset to healthy
+            </button>
+            <button className="button small" onClick={() => void loadCheckout()} disabled={checkoutLoading || checkoutActionLoading} aria-label="Refresh checkout simulation data">
+              <RefreshCw size={13} />{checkoutLoading ? "Refreshing…" : "Refresh"}
+            </button>
+          </div>
+        </div>
+        <div className="checkout-boundary">
+          <ShieldCheck size={14} aria-hidden="true" />
+          <span>Deterministic training scenario. Every signal below is synthetic and isolated from live infrastructure.</span>
+        </div>
+      </section>
+
+      <div className="checkout-service-grid">
+        {checkoutMetrics.services.map((service) => {
+          const serviceHealth = checkoutHealth?.services.find((item) => item.name === service.name);
+          const values = [
+            ["Latency", formatValue(service.latency_ms, " ms")],
+            ["Error rate", formatValue(service.error_rate_percent, "%")],
+            ["Requests", formatValue(service.request_volume_rps, " rps")],
+            ["DB pool", formatValue(service.db_pool_utilization_percent, "%")],
+          ];
+          return <article className="checkout-service surface" key={service.service_id}>
+            <div className="checkout-service-head">
+              <div>
+                <div className="checkout-service-name">{service.name}</div>
+                <div className="checkout-service-summary">{serviceHealth?.summary ?? "Service health summary unavailable."}</div>
+              </div>
+              <Status value={serviceHealth?.status ?? service.status} />
+            </div>
+            <div className="checkout-current-grid">
+              {values.map(([label, value]) => <div className="checkout-current" key={label}>
+                <div className="metric-label">{label}</div><div className="metric-value">{value}</div>
+              </div>)}
+              <div className="checkout-current">
+                <div className="metric-label">DB pool size</div><div className="metric-value">{service.db_pool_size ?? "—"}</div>
+              </div>
+            </div>
+            <div className="checkout-chart-grid">
+              {metricsToChart.map((metric) => <div className="checkout-chart-panel" key={metric.key}>
+                <div className="chart-caption">{metric.label} history <span>· synthetic</span></div>
+                {service.history.length ? <div className="checkout-chart-wrap">
+                  <ResponsiveContainer width="100%" height="100%">
+                    <LineChart data={service.history} margin={{ top: 8, right: 7, bottom: 0, left: 0 }}>
+                      <CartesianGrid stroke="#203247" vertical={false} />
+                      <XAxis dataKey="timestamp" tickFormatter={(value: string) => new Date(value).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })} tick={{ fill: "#71869b", fontSize: 8 }} tickLine={false} axisLine={false} minTickGap={22} />
+                      <YAxis hide domain={["auto", "auto"]} />
+                      <Tooltip labelFormatter={(value) => new Date(String(value)).toLocaleString()} formatter={(value) => [value == null ? "—" : `${value} ${metric.unit}`, metric.label]} contentStyle={{ background: "#101e2e", border: "1px solid #30475c", borderRadius: 5, color: "#dce7f2", fontSize: 10 }} />
+                      <Line type="monotone" dataKey={metric.key} stroke={metric.color} strokeWidth={1.6} dot={false} activeDot={{ r: 3 }} connectNulls={false} />
+                    </LineChart>
+                  </ResponsiveContainer>
+                </div> : <div className="checkout-chart-empty">No history points returned.</div>}
+              </div>)}
+            </div>
+            <div className="checkout-service-foot">
+              <span>{service.history.length} timestamped samples</span>
+              <span>{service.is_synthetic ? "Synthetic" : "Not marked synthetic"}</span>
+            </div>
+          </article>;
+        })}
+      </div>
+
+      <Surface title="Deployment & log timeline" kicker="Persistent backend events · chronological" action={<span className="simulation-tag">Synthetic event stream</span>}>
+        <div className="checkout-timeline">
+          {checkoutEvents === null ? <EmptyState title="Event timeline unavailable" detail="Retry the checkout simulation request to load backend event records." icon={Activity} />
+            : events.length ? events.map((event) => <article className="checkout-event" key={event.id}>
+              <div className={`checkout-event-mark ${event.kind}`} />
+              <div className="checkout-event-main">
+                <div className="checkout-event-heading">
+                  <div className="checkout-event-title">{event.title}</div>
+                  <div className="checkout-event-tags"><span className={`checkout-event-kind ${event.kind}`}>{event.kind}</span><span className="checkout-event-level">{event.level}</span></div>
+                </div>
+                <div className="checkout-event-detail">{event.detail}</div>
+                <div className="checkout-event-meta"><span>{event.service}</span><span>{new Date(event.timestamp).toLocaleString()}</span><span>{event.is_synthetic ? "Synthetic" : "Not marked synthetic"}</span></div>
+              </div>
+            </article>) : <EmptyState title="No checkout events yet" detail="Deployment and log records will appear here as the simulation runs." icon={Activity} />}
+        </div>
+      </Surface>
+    </>;
+  }
+
   function renderPostmortem(pm: Postmortem) {
     return <article className="postmortem" key={pm.id}>
       <div className="detail-heading"><div><h3>{pm.title}</h3><div className="runbook-meta">INC-{String(pm.incident_id).padStart(4, "0")} · {new Date(pm.created_at).toLocaleString()}</div></div><SyntheticTag /></div>
@@ -359,6 +530,7 @@ export default function App() {
     }
     if (section === "Evidence Chain") return renderEvidence();
     if (section === "Services & Metrics") return renderServices();
+    if (section === "Checkout Simulation") return renderCheckoutSimulation();
     if (section === "Knowledge Base") return <>
       <Surface title="Runbook search" kicker="Synthetic operational reference">
         <form className="surface-body" onSubmit={(event) => void searchKnowledge(event)} style={{ display: "flex", gap: 9 }}>
@@ -412,7 +584,7 @@ export default function App() {
         <div className="top-meta"><SyntheticTag /><div className="health"><span className="health-light" style={{ background: health === "error" ? "var(--red)" : health === "checking" ? "var(--amber)" : "var(--green)" }} />{health === "ready" ? "API connected" : health === "checking" ? "Checking API" : "API unavailable"}</div><span className="top-time">SIM / {new Date().toLocaleDateString()}</span></div>
       </header>
       <div className="content">
-        {error && <div className="error-banner" role="alert"><span><AlertTriangle size={14} style={{ verticalAlign: "middle", marginRight: 7 }} />{error}</span><button className="button small" onClick={() => void load()}><RefreshCw size={12} />Retry</button></div>}
+        {error && <div className="error-banner" role="alert"><span><AlertTriangle size={14} style={{ verticalAlign: "middle", marginRight: 7 }} />{error}</span><button className="button small" onClick={() => section === "Checkout Simulation" ? void loadCheckout() : void load()}><RefreshCw size={12} />Retry</button></div>}
         <div className="page-head"><div><div className="eyebrow">Autonomous AI-powered incident commander</div><h1>{heading}</h1><p className="page-desc">{description}</p></div><div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}><SyntheticTag />{section === "Incidents" && <button className="button primary" onClick={() => setCreateOpen(true)}><Plus size={14} />Create scenario</button>}</div></div>
         {renderMain()}
       </div>
