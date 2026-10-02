@@ -109,8 +109,25 @@ export type Recommendation = {
   id: number;
   incident_id: number;
   action: string;
+  action_code: string;
   risk: "low" | "medium" | "high";
   confidence: number;
+  reason: string;
+  supporting_evidence: string[];
+  expected_impact: string;
+  preconditions: string[];
+  rollback_plan: string;
+  approval_status: string;
+  created_at: string;
+};
+
+export type RemediationAuditEvent = {
+  id: number;
+  incident_id: number | null;
+  event_type: string;
+  actor: string | null;
+  action: string | null;
+  details: Record<string, unknown>;
   created_at: string;
 };
 
@@ -123,6 +140,9 @@ export type Remediation = {
   approved_at: string | null;
   validation_passed: boolean | null;
   result: string | null;
+  before_metrics?: Record<string, number | string> | null;
+  after_metrics?: Record<string, number | string> | null;
+  thresholds?: Record<string, number | string | boolean> | null;
 };
 
 export type Postmortem = {
@@ -173,6 +193,7 @@ export type CheckoutServiceMetrics = {
 export type CheckoutSimulationMetrics = {
   state: "healthy" | "incident";
   run_number: number;
+  active_incident_id: number | null;
   updated_at: string;
   services: CheckoutServiceMetrics[];
   is_synthetic: boolean;
@@ -218,6 +239,7 @@ export type Investigation = {
   runbooks: Runbook[];
   recommendation: Recommendation | null;
   remediation: Remediation | null;
+  auditLog: RemediationAuditEvent[];
   postmortem: Postmortem | null;
 };
 
@@ -398,7 +420,7 @@ export const api = {
   investigation: async (id: number): Promise<Investigation> => {
     const incident = await request<Incident>(`/incidents/${id}`);
     const query = new URLSearchParams({ q: incident.service, skip: "0", limit: "100" });
-    const [evidence, metrics, runbooks, recommendation, actions, postmortem] = await Promise.all([
+    const [evidence, metrics, runbooks, recommendation, actions, auditLog, postmortem] = await Promise.all([
       pageItems<Evidence>(`/incidents/${id}/evidence?skip=0&limit=100`),
       pageItems<Metric>(`/incidents/${id}/metrics?skip=0&limit=100`),
       pageItems<Runbook>(`/knowledge?${query.toString()}`),
@@ -412,6 +434,7 @@ export const api = {
         created_at: string;
         updated_at: string;
       }>(`/incidents/${id}/actions?skip=0&limit=100`),
+      pageItems<RemediationAuditEvent>(`/incidents/${id}/audit-log?skip=0&limit=100`),
       optional<Postmortem>(`/incidents/${id}/postmortem`),
     ]);
     return {
@@ -421,6 +444,7 @@ export const api = {
       runbooks,
       recommendation,
       remediation: actions[0] ? toRemediation(actions[0]) : null,
+      auditLog,
       postmortem,
     };
   },
@@ -449,15 +473,32 @@ export const api = {
       body: form,
     });
   },
-  approveRemediation: (incidentId: number) =>
-    request<Remediation>(`/incidents/${incidentId}/remediation/approve`, {
+  approveRemediation: (incidentId: number, recommendationId: number, operatorName: string, actionCode: string) =>
+    request<Remediation>(`/incidents/${incidentId}/approve`, {
       method: "POST",
-      body: JSON.stringify({ approved_by: "On-call operator" }),
+      body: JSON.stringify({
+        operator_name: operatorName,
+        recommendation_id: recommendationId,
+        action_code: actionCode,
+      }),
     }),
-  rejectRemediation: (incidentId: number) =>
+  simulateFix: (incidentId: number, recommendationId: number, operatorName: string, actionCode: string) =>
+    request<Remediation>(`/incidents/${incidentId}/simulate-fix`, {
+      method: "POST",
+      body: JSON.stringify({
+        operator_name: operatorName,
+        recommendation_id: recommendationId,
+        action_code: actionCode,
+      }),
+    }),
+  rejectRemediation: (incidentId: number, recommendationId: number, operatorName: string, actionCode: string) =>
     request<Remediation>(`/incidents/${incidentId}/remediation/reject`, {
       method: "POST",
-      body: JSON.stringify({ approved_by: "On-call operator" }),
+      body: JSON.stringify({
+        approved_by: operatorName,
+        recommendation_id: recommendationId,
+        action_code: actionCode,
+      }),
     }),
   validateRecovery: (remediationId: number) =>
     request<Remediation>(`/remediations/${remediationId}/validate`, { method: "POST" }),

@@ -20,6 +20,48 @@ from .models import (
 )
 
 MIGRATION_VERSION = "normalized_incident_schema_v2"
+REMEDIATION_MIGRATION_VERSION = "simulation_remediation_audit_v1"
+
+
+def migrate_simulation_remediation_schema(db_engine: Engine) -> None:
+    """Additive migration for the simulation-only approval and audit workflow."""
+    inspector = __import__("sqlalchemy").inspect(db_engine)
+    tables = set(inspector.get_table_names())
+    with db_engine.begin() as connection:
+        marker = connection.execute(
+            text("SELECT version FROM schema_migrations WHERE version = :version"),
+            {"version": REMEDIATION_MIGRATION_VERSION},
+        ).first()
+        if marker:
+            return
+
+        additions = {
+            "recommendations": {
+                "action_code": "VARCHAR(80) NOT NULL DEFAULT ''",
+                "reason": "TEXT NOT NULL DEFAULT ''",
+                "supporting_evidence": "TEXT NOT NULL DEFAULT '[]'",
+                "expected_impact": "TEXT NOT NULL DEFAULT ''",
+                "preconditions": "TEXT NOT NULL DEFAULT '[]'",
+                "rollback_plan": "TEXT NOT NULL DEFAULT ''",
+                "approval_status": "VARCHAR(24) NOT NULL DEFAULT 'pending'",
+            },
+            "checkout_simulation_state": {
+                "active_incident_id": "INTEGER REFERENCES incidents(id) ON DELETE SET NULL",
+            },
+        }
+        for table, columns in additions.items():
+            if table not in tables:
+                continue
+            existing = {column["name"] for column in inspector.get_columns(table)}
+            for name, declaration in columns.items():
+                if name not in existing:
+                    connection.exec_driver_sql(
+                        f'ALTER TABLE "{table}" ADD COLUMN "{name}" {declaration}'
+                    )
+        connection.execute(
+            text("INSERT INTO schema_migrations (version, applied_at) VALUES (:version, :applied_at)"),
+            {"version": REMEDIATION_MIGRATION_VERSION, "applied_at": datetime.now(timezone.utc)},
+        )
 
 
 def _parse_datetime(value):

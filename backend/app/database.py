@@ -81,8 +81,9 @@ def initialize_database(db_engine: Engine = engine) -> None:
             """
         )
 
-    from .migrations import migrate_legacy_records
+    from .migrations import migrate_legacy_records, migrate_simulation_remediation_schema
 
+    migrate_simulation_remediation_schema(db_engine)
     migrate_legacy_records(db_engine)
 
 

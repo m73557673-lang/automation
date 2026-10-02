@@ -24,6 +24,7 @@ from .models import (
     OperationalDocumentChunk,
     Postmortem,
     Recommendation,
+    RemediationAuditEvent,
     Service,
     utc_now,
 )
@@ -47,6 +48,8 @@ from .schemas import (
     PostmortemPage,
     RecommendationOut,
     RemediationOut,
+    RemediationAuditEventOut,
+    SimulationApprovalRequest,
     ServiceOut,
     ServicePage,
 )
@@ -90,6 +93,16 @@ from .services.knowledge_base import (
     seed_operational_documents,
     serialize_document,
     serialize_passage,
+)
+from .services.remediation import (
+    RESTORE_POOL_ACTION_CODE,
+    SimulationRemediationError,
+    add_audit_event,
+    approve_simulated_remediation,
+    reject_simulated_remediation,
+    serialize_audit_event,
+    serialize_recommendation as serialize_remediation_recommendation,
+    simulate_approved_remediation,
 )
 
 
@@ -441,7 +454,7 @@ def create_app(
         )
         if recommendation is None:
             raise HTTPException(status_code=404, detail="No recommendation is recorded for this incident.")
-        return recommendation
+        return serialize_remediation_recommendation(recommendation)
 
     @router.get("/incidents/{incident_id}/actions", response_model=ActionPage)
     def incident_actions(
@@ -457,6 +470,30 @@ def create_app(
             select(Action).where(filters).order_by(Action.created_at.desc()).offset(skip).limit(limit)
         ).all()
         return _page([serialize_action(item) for item in records], total, skip, limit)
+
+    @router.get(
+        "/incidents/{incident_id}/audit-log",
+        response_model=Page[RemediationAuditEventOut],
+    )
+    def incident_remediation_audit_log(
+        incident_id: int,
+        skip: int = Query(default=0, ge=0),
+        limit: int = Query(default=50, ge=1, le=100),
+        db: Session = Depends(get_db),
+    ):
+        _incident_or_404(db, incident_id)
+        filters = RemediationAuditEvent.incident_id == incident_id
+        total = db.scalar(
+            select(func.count()).select_from(RemediationAuditEvent).where(filters)
+        ) or 0
+        events = db.scalars(
+            select(RemediationAuditEvent)
+            .where(filters)
+            .order_by(RemediationAuditEvent.created_at.desc(), RemediationAuditEvent.id.desc())
+            .offset(skip)
+            .limit(limit)
+        ).all()
+        return _page([serialize_audit_event(item) for item in events], total, skip, limit)
 
     @router.get("/incidents/{incident_id}/postmortem", response_model=PostmortemOut)
     def incident_postmortem(incident_id: int, db: Session = Depends(get_db)):
@@ -663,45 +700,48 @@ def create_app(
         ).all()
         return _page([serialize_postmortem(db, item) for item in records], total, skip, limit)
 
+    @router.post("/incidents/{incident_id}/approve", response_model=RemediationOut)
     @router.post(
         "/incidents/{incident_id}/remediation/approve",
         response_model=RemediationOut,
+        include_in_schema=False,
     )
     def approve_remediation(
         incident_id: int,
-        payload: ActionDecision = Body(default=ActionDecision(approved_by="Incident Commander UI")),
+        payload: SimulationApprovalRequest = Body(default=SimulationApprovalRequest()),
         db: Session = Depends(get_db),
     ):
-        incident = _incident_or_404(db, incident_id)
-        latest = db.scalar(
-            select(Action).where(Action.incident_id == incident_id).order_by(Action.created_at.desc()).limit(1)
-        )
-        if latest and latest.status in {"approved", "simulated_validated"}:
-            return serialize_remediation(latest)
-        if latest and latest.status == "rejected":
-            raise HTTPException(status_code=409, detail="This simulation proposal was rejected.")
-        recommendation = db.scalar(
-            select(Recommendation)
-            .where(Recommendation.incident_id == incident_id)
-            .order_by(Recommendation.created_at.desc())
-            .limit(1)
-        )
-        if recommendation is None:
-            raise HTTPException(status_code=404, detail="No recommendation is available to approve.")
-        action = Action(
-            incident_id=incident.id,
-            action=recommendation.action,
-            approved_by=payload.approved_by,
-            status="approved",
-            result="Approved for simulation only. No production service or infrastructure was changed.",
-        )
-        if incident.status == "open":
-            incident.status = "investigating"
-        db.add(action)
-        db.commit()
-        db.refresh(action)
+        try:
+            result = approve_simulated_remediation(
+                db,
+                incident_id=incident_id,
+                operator_name=payload.operator_name,
+                action_code=payload.action_code,
+                recommendation_id=payload.recommendation_id,
+            )
+        except SimulationRemediationError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
         logger.info("simulation action approved incident_id=%s", incident_id)
-        return serialize_remediation(action)
+        return result
+
+    @router.post("/incidents/{incident_id}/simulate-fix", response_model=RemediationOut)
+    def simulate_fix(
+        incident_id: int,
+        payload: SimulationApprovalRequest = Body(default=SimulationApprovalRequest()),
+        db: Session = Depends(get_db),
+    ):
+        try:
+            result = simulate_approved_remediation(
+                db,
+                incident_id=incident_id,
+                operator_name=payload.operator_name,
+                action_code=payload.action_code,
+                recommendation_id=payload.recommendation_id,
+            )
+        except SimulationRemediationError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+        logger.info("synthetic remediation executed incident_id=%s", incident_id)
+        return result
 
     @router.post(
         "/incidents/{incident_id}/remediation/reject",
@@ -712,52 +752,46 @@ def create_app(
         payload: ActionDecision = Body(default=ActionDecision(approved_by="Incident Commander UI")),
         db: Session = Depends(get_db),
     ):
-        incident = _incident_or_404(db, incident_id)
-        latest = db.scalar(
-            select(Action).where(Action.incident_id == incident_id).order_by(Action.created_at.desc()).limit(1)
-        )
-        if latest and latest.status in {"approved", "simulated_validated"}:
-            raise HTTPException(status_code=409, detail="An approved simulation cannot be rejected.")
         recommendation = db.scalar(
             select(Recommendation)
             .where(Recommendation.incident_id == incident_id)
             .order_by(Recommendation.created_at.desc())
             .limit(1)
         )
-        if recommendation is None:
-            raise HTTPException(status_code=404, detail="No recommendation is available to reject.")
-        action = Action(
-            incident_id=incident.id,
-            action=recommendation.action,
-            status="rejected",
-            result=f"Rejected by {payload.approved_by}. No changes were made to infrastructure.",
-        )
-        db.add(action)
-        db.commit()
-        db.refresh(action)
-        return serialize_remediation(action)
+        try:
+            return reject_simulated_remediation(
+                db,
+                incident_id=incident_id,
+                operator_name=payload.approved_by,
+                action_code=recommendation.action_code if recommendation else None,
+                recommendation_id=recommendation.id if recommendation else None,
+            )
+        except SimulationRemediationError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
 
     @router.post("/remediations/{remediation_id}/validate", response_model=RemediationOut)
     def validate_recovery(remediation_id: int, db: Session = Depends(get_db)):
         action = db.get(Action, remediation_id)
         if action is None:
             raise HTTPException(status_code=404, detail="Simulation action not found.")
-        if action.status != "approved":
-            raise HTTPException(status_code=409, detail="Only an approved simulation can be validated.")
-        action.status = "simulated_validated"
-        action.result = (
-            "Simulated recovery check passed. This records a prototype result only; "
-            "no production metrics or infrastructure were changed."
+        recommendation = db.scalar(
+            select(Recommendation)
+            .where(Recommendation.incident_id == action.incident_id)
+            .order_by(Recommendation.created_at.desc(), Recommendation.id.desc())
+            .limit(1)
         )
-        action.updated_at = utc_now()
-        incident = db.get(Incident, action.incident_id)
-        if incident:
-            incident.status = "resolved"
-            incident.resolved_at = utc_now()
-        db.commit()
-        db.refresh(action)
+        try:
+            result = simulate_approved_remediation(
+                db,
+                incident_id=action.incident_id,
+                operator_name=action.approved_by,
+                action_code=recommendation.action_code if recommendation else None,
+                recommendation_id=recommendation.id if recommendation else None,
+            )
+        except SimulationRemediationError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
         logger.info("simulated recovery check recorded action_id=%s", remediation_id)
-        return serialize_remediation(action)
+        return result
 
     @router.post("/incidents/{incident_id}/postmortem/generate", response_model=PostmortemOut)
     def generate_postmortem(incident_id: int, db: Session = Depends(get_db)):

@@ -1,4 +1,5 @@
 import logging
+import json
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import func, select
@@ -283,8 +284,15 @@ def serialize_recommendation(recommendation: Recommendation) -> dict:
         "id": recommendation.id,
         "incident_id": recommendation.incident_id,
         "action": recommendation.action,
+        "action_code": recommendation.action_code,
         "risk": recommendation.risk,
         "confidence": recommendation.confidence,
+        "reason": recommendation.reason,
+        "supporting_evidence": json.loads(recommendation.supporting_evidence or "[]"),
+        "expected_impact": recommendation.expected_impact,
+        "preconditions": json.loads(recommendation.preconditions or "[]"),
+        "rollback_plan": recommendation.rollback_plan,
+        "approval_status": recommendation.approval_status,
         "created_at": recommendation.created_at,
     }
 
@@ -298,6 +306,15 @@ def _default_recommendation(incident: Incident) -> Recommendation:
         ),
         risk="low",
         confidence=0.55,
+        reason=(
+            "This recommendation is review guidance for a synthetic incident. "
+            "It does not authorize or perform infrastructure changes."
+        ),
+        supporting_evidence="[]",
+        expected_impact="No changes are made; review the incident evidence and runbooks.",
+        preconditions="[]",
+        rollback_plan="No change is made, so no rollback is required.",
+        approval_status="pending",
     )
 
 

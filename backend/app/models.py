@@ -121,6 +121,9 @@ class CheckoutSimulationState(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
     state: Mapped[str] = mapped_column(String(16), default="healthy", nullable=False)
     run_number: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    active_incident_id: Mapped[int | None] = mapped_column(
+        ForeignKey("incidents.id", ondelete="SET NULL"), nullable=True
+    )
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
 
 
@@ -209,8 +212,15 @@ class Recommendation(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     incident_id: Mapped[int] = mapped_column(ForeignKey("incidents.id", ondelete="CASCADE"), nullable=False)
     action: Mapped[str] = mapped_column(Text, nullable=False)
+    action_code: Mapped[str] = mapped_column(String(80), default="", nullable=False)
     risk: Mapped[str] = mapped_column(String(16), nullable=False)
     confidence: Mapped[float] = mapped_column(Float, nullable=False)
+    reason: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    supporting_evidence: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    expected_impact: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    preconditions: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    rollback_plan: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    approval_status: Mapped[str] = mapped_column(String(24), default="pending", nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
 
     incident: Mapped[Incident] = relationship(back_populates="recommendations")
@@ -236,6 +246,24 @@ class Action(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False)
 
     incident: Mapped[Incident] = relationship(back_populates="actions")
+
+
+class RemediationAuditEvent(Base):
+    __tablename__ = "remediation_audit_events"
+    __table_args__ = (
+        Index("ix_remediation_audit_incident_created", "incident_id", "created_at"),
+        Index("ix_remediation_audit_kind_created", "event_type", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    incident_id: Mapped[int | None] = mapped_column(
+        ForeignKey("incidents.id", ondelete="SET NULL"), nullable=True
+    )
+    event_type: Mapped[str] = mapped_column(String(48), nullable=False)
+    actor: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    action: Mapped[str | None] = mapped_column(Text, nullable=True)
+    details: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
 
 
 class Postmortem(Base):

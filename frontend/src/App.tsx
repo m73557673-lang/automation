@@ -89,6 +89,7 @@ export default function App() {
   const [createOpen, setCreateOpen] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [actionLoading, setActionLoading] = useState(false);
+  const [operatorName, setOperatorName] = useState("");
   const [aiActionLoading, setAiActionLoading] = useState(false);
   const [checkoutMetrics, setCheckoutMetrics] = useState<CheckoutSimulationMetrics | null>(null);
   const [checkoutHealth, setCheckoutHealth] = useState<CheckoutSimulationHealth | null>(null);
@@ -265,21 +266,31 @@ export default function App() {
     finally { setSubmitting(false); }
   }
 
-  async function remediationAction(action: "approve" | "reject" | "validate") {
-    if (!investigation || !selected) return;
-    if (action !== "validate" && !window.confirm(`${action === "approve" ? "Approve" : "Reject"} this simulated remediation for ${selected.title}? No infrastructure will be changed.`)) return;
+  async function remediationAction(action: "approve" | "reject" | "simulate") {
+    const recommendation = investigation?.recommendation;
+    const operator = operatorName.trim();
+    if (!investigation || !selected || !recommendation) return;
+    if (!operator) {
+      setError("Enter your name so the simulation decision is attributed to an operator.");
+      return;
+    }
+    if (action !== "simulate" && !window.confirm(`${action === "approve" ? "Approve" : "Reject"} this simulated remediation for ${selected.title}? No live infrastructure will be changed.`)) return;
+    if (action === "simulate" && !window.confirm("Run the approved recovery simulation? Only synthetic demo configuration and telemetry will be updated.")) return;
     setActionLoading(true);
     setError("");
     try {
       let remediation: Remediation;
-      if (action === "approve") remediation = await api.approveRemediation(selected.id);
-      else if (action === "reject") remediation = await api.rejectRemediation(selected.id);
-      else if (investigation.remediation) remediation = await api.validateRecovery(investigation.remediation.id);
-      else return;
-      setInvestigation((current) => current ? { ...current, remediation } : current);
-      const fresh = await api.incidents();
-      setIncidents(fresh);
+      if (action === "approve") remediation = await api.approveRemediation(selected.id, recommendation.id, operator, recommendation.action_code);
+      else if (action === "reject") remediation = await api.rejectRemediation(selected.id, recommendation.id, operator, recommendation.action_code);
+      else remediation = await api.simulateFix(selected.id, recommendation.id, operator, recommendation.action_code);
+      const [freshInvestigation, freshIncidents] = await Promise.all([
+        api.investigation(selected.id),
+        api.incidents(),
+      ]);
+      setInvestigation({ ...freshInvestigation, remediation });
+      setIncidents(freshIncidents);
       if (dashboard) setDashboard(await api.dashboard());
+      if (action === "simulate") await loadCheckout();
     } catch (reason) { setError(reason instanceof Error ? reason.message : "The simulated action could not be completed."); }
     finally { setActionLoading(false); }
   }
@@ -288,8 +299,14 @@ export default function App() {
     setCheckoutActionLoading(true);
     setError("");
     try {
-      setCheckoutMetrics(await api.startCheckoutSimulation());
+      const started = await api.startCheckoutSimulation();
+      setCheckoutMetrics(started);
       await loadCheckout();
+      if (started.active_incident_id) {
+        const fresh = await api.incidents();
+        setIncidents(fresh);
+        await selectIncident(started.active_incident_id);
+      }
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "Could not start the checkout incident simulation.");
     } finally {
@@ -302,8 +319,14 @@ export default function App() {
     setCheckoutActionLoading(true);
     setError("");
     try {
-      setCheckoutMetrics(await api.resetCheckoutSimulation());
+      const reset = await api.resetCheckoutSimulation();
+      setCheckoutMetrics(reset);
       await loadCheckout();
+      const fresh = await api.incidents();
+      setIncidents(fresh);
+      if (selectedId !== null && selectedId === checkoutMetrics?.active_incident_id) {
+        await selectIncident(selectedId);
+      }
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "Could not reset the checkout simulation.");
     } finally {
@@ -565,27 +588,53 @@ export default function App() {
     if (investigationLoading) return <LoadingState />;
     if (!selected) return <EmptyState title="No scenario selected" detail="Select an incident before reviewing simulated remediation." icon={ListChecks} />;
     const remediation = investigation?.remediation;
+    const recommendation = investigation?.recommendation;
+    const isAllowlistedDemo = recommendation?.action_code === "restore_db_pool_size_50";
+    const operatorDecisionOpen = isAllowlistedDemo
+      && ["pending", "approved"].includes(recommendation.approval_status);
+    const metricSummary = (metrics: Record<string, number | string> | null | undefined) =>
+      metrics ? Object.entries(metrics).map(([key, value]) => `${key.replace(/_/g, " ")}: ${value}`).join(" · ") : "";
     return <div className="section-grid">
       <Surface title="Operator decision" kicker={`INC-${String(selected.id).padStart(4, "0")} · simulated`}>
         <div className="surface-body">
-          {investigation?.recommendation && <div className="notice" style={{ marginTop: 0 }}>
-            Recorded guidance · {investigation.recommendation.risk} risk · {Math.round(investigation.recommendation.confidence * 100)}% confidence.
-            {" "}{investigation.recommendation.action} This deterministic guidance is not AI output and does not execute an action.
+          {recommendation && <div className="remediation-box">
+            <div className="detail-heading">
+              <div className="remediation-action">Proposed action · {recommendation.action}</div>
+              <Status value={recommendation.approval_status} />
+            </div>
+            <div className="remediation-copy"><strong>Risk:</strong> {recommendation.risk} · <strong>Incident:</strong> INC-{String(selected.id).padStart(4, "0")}</div>
+            <p className="remediation-copy"><strong>Reason:</strong> {recommendation.reason}</p>
+            <p className="remediation-copy"><strong>Expected impact:</strong> {recommendation.expected_impact}</p>
+            <p className="remediation-copy"><strong>Supporting evidence:</strong></p>
+            <ul className="remediation-evidence">{recommendation.supporting_evidence.map((item) => <li key={item}>{item}</li>)}</ul>
+            {recommendation.preconditions.length > 0 && <><p className="remediation-copy"><strong>Preconditions:</strong></p><ul className="remediation-evidence">{recommendation.preconditions.map((item) => <li key={item}>{item}</li>)}</ul></>}
+            <p className="remediation-copy"><strong>Rollback plan:</strong> {recommendation.rollback_plan}</p>
           </div>}
           {remediation ? <div className="remediation-box">
             <div className="detail-heading"><div className="remediation-action">{remediation.action}</div><Status value={remediation.state} /></div>
             <p className="remediation-copy">{remediation.result || "Proposed response for this simulated scenario. Review carefully before recording a decision."}</p>
             <div className="action-row">
-              {remediation.state === "approved" && <button className="button success" onClick={() => void remediationAction("validate")} disabled={actionLoading}><CheckCircle2 size={14} />{actionLoading ? "Checking…" : "Run simulated recovery check"}</button>}
-              {remediation.state === "rejected" && <span className="activity-detail">This proposal was rejected. No action was performed.</span>}
+              {remediation.state === "approved" && recommendation?.approval_status === "approved" && <button className="button success" onClick={() => void remediationAction("simulate")} disabled={actionLoading}><CheckCircle2 size={14} />{actionLoading ? "Simulating…" : "Run approved simulation"}</button>}
+              {remediation.state === "rejected" && <span className="activity-detail">{recommendation?.approval_status === "cancelled" ? "The simulation was safely reset; no live action was performed." : "This proposal was rejected or its simulation did not pass validation."}</span>}
               {remediation.state === "validated" && <span className="activity-detail"><CheckCircle2 size={14} style={{ verticalAlign: "middle", marginRight: 5, color: "var(--green)" }} />Recovery check {remediation.validation_passed ? "passed" : "did not pass"} · simulated</span>}
             </div>
+            {remediation.before_metrics && <p className="remediation-copy"><strong>Before:</strong> {metricSummary(remediation.before_metrics)}</p>}
+            {remediation.after_metrics && <p className="remediation-copy"><strong>After:</strong> {metricSummary(remediation.after_metrics)}</p>}
           </div> : <div className="remediation-box">
             <div className="remediation-action">No remediation decision recorded</div>
-            <p className="remediation-copy">An available response may be reviewed and explicitly approved or rejected. This workspace only records a simulated decision.</p>
-            <div className="action-row">
-              <button className="button success" onClick={() => void remediationAction("approve")} disabled={actionLoading || !investigation}><Check size={14} />Approve simulated action</button>
-              <button className="button danger" onClick={() => void remediationAction("reject")} disabled={actionLoading || !investigation}><X size={14} />Reject proposal</button>
+            <p className="remediation-copy">{isAllowlistedDemo ? "Review the allowlisted synthetic proposal, identify yourself, then explicitly approve or reject it." : "Investigation remains read-only. Only the active checkout simulation has an allowlisted simulated remediation."}</p>
+          </div>}
+          {operatorDecisionOpen && <div style={{ maxWidth: 440, marginTop: 12 }}>
+            <label className="field">
+              <span>Operator name</span>
+              <input autoComplete="name" value={operatorName} onChange={(event) => setOperatorName(event.target.value)} placeholder="Enter your name to record the decision" />
+            </label>
+            <div className="action-row" style={{ marginTop: 10 }}>
+              {recommendation?.approval_status === "pending" && <>
+                <button className="button success" onClick={() => void remediationAction("approve")} disabled={actionLoading || !operatorName.trim()}><Check size={14} />Approve for simulation</button>
+                <button className="button danger" onClick={() => void remediationAction("reject")} disabled={actionLoading || !operatorName.trim()}><X size={14} />Reject recommendation</button>
+              </>}
+              {recommendation?.approval_status === "approved" && <span className="activity-detail">Approved by the named operator. The separate simulation step is still required.</span>}
             </div>
           </div>}
           <div className="notice">Approval records a simulated choice only. No production systems, credentials, or infrastructure are connected to this workspace.</div>
@@ -593,9 +642,23 @@ export default function App() {
       </Surface>
       <Surface title="Guardrails" kicker="Always in effect">
         <div className="surface-body">
-          {[["Human approval", "A human operator must explicitly record a decision."], ["Simulation only", "No production telemetry or infrastructure changes."], ["Recovery validation", "Checks are simulated and do not probe live systems."]].map(([title, body]) => <div className="activity-item" key={title}><div className="activity-mark" /><div><div className="activity-title">{title}</div><div className="activity-detail">{body}</div></div></div>)}
+          {[["Human approval", "A clearly identified operator must explicitly approve the allowlisted action."], ["Simulation only", "Only synthetic checkout configuration and telemetry can change."], ["Recovery validation", "Predefined thresholds are checked before the incident can be resolved."], ["Safe reset", "Reset cancels pending simulation approval and restores the healthy demo baseline."]].map(([title, body]) => <div className="activity-item" key={title}><div className="activity-mark" /><div><div className="activity-title">{title}</div><div className="activity-detail">{body}</div></div></div>)}
         </div>
       </Surface>
+      {investigation?.auditLog && <Surface title="Remediation audit log" kicker="Recorded decisions and simulation results">
+        <div className="checkout-timeline">
+          {investigation.auditLog.length ? investigation.auditLog.map((event) => <article className="checkout-event" key={event.id}>
+            <div className="checkout-event-mark log" />
+            <div className="checkout-event-main">
+              <div className="checkout-event-heading"><div className="checkout-event-title">{event.event_type.replace(/_/g, " ")}</div><span className="checkout-event-level">{event.actor ?? "System"}</span></div>
+              {event.action && <div className="checkout-event-detail">{event.action}</div>}
+              {typeof event.details.reason === "string" && <div className="checkout-event-detail">{event.details.reason}</div>}
+              {typeof event.details.validation_passed === "boolean" && <div className="checkout-event-detail">Validation {event.details.validation_passed ? "passed" : "failed"} · before/after metrics and threshold checks recorded.</div>}
+              <div className="checkout-event-meta"><span>{new Date(event.created_at).toLocaleString()}</span><span>Audit event #{event.id}</span></div>
+            </div>
+          </article>) : <EmptyState title="No remediation decisions recorded" detail="Recommendations, decisions, and simulation attempts will be added here." icon={Activity} />}
+        </div>
+      </Surface>}
     </div>;
   }
 
@@ -653,6 +716,15 @@ export default function App() {
               {checkoutActionLoading ? <LoaderCircle size={14} /> : <RefreshCw size={14} />}
               Reset to healthy
             </button>
+            {checkoutMetrics.active_incident_id !== null && <button className="button success" onClick={() => {
+              const incidentId = checkoutMetrics.active_incident_id;
+              if (incidentId !== null) {
+                setSection("Remediation");
+                void selectIncident(incidentId);
+              }
+            }} disabled={checkoutActionLoading}>
+              <ListChecks size={14} />Review remediation
+            </button>}
             <button className="button" onClick={() => void runCheckoutAIInvestigation()} disabled={aiActionLoading}>
               {aiActionLoading ? <LoaderCircle size={14} /> : <Sparkles size={14} />}
               {aiActionLoading ? "Investigating…" : "Run AI investigation"}

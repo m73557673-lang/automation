@@ -3,12 +3,22 @@ from datetime import datetime, timezone
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import func, select
+from sqlalchemy import func, inspect, select
 from sqlalchemy.orm import sessionmaker
 
 from app.database import create_sqlite_engine, get_db, initialize_database
 from app.main import create_app
-from app.models import Action, Deployment, Incident, LogEvent, Metric, Service
+from app.models import (
+    Action,
+    CheckoutSimulationState,
+    Deployment,
+    Incident,
+    LogEvent,
+    Metric,
+    Recommendation,
+    RemediationAuditEvent,
+    Service,
+)
 
 
 @pytest.fixture
@@ -92,40 +102,198 @@ def test_incident_create_validation_and_related_records(test_app):
     assert missing_service.status_code == 404
 
 
-def test_simulated_approval_and_validation_never_change_metric_records(test_app):
+def test_unapproved_and_non_allowlisted_remediation_requests_are_rejected_and_audited(test_app):
     client, factory = test_app
-    incident_id = client.get("/incidents?limit=1").json()["items"][0]["id"]
-    with factory() as db:
-        before_metrics = list(db.scalars(select(Metric.value).order_by(Metric.id)).all())
-        before_services = list(db.scalars(select(Service.status).order_by(Service.id)).all())
+    started = client.post("/api/simulation/start").json()
+    incident_id = started["active_incident_id"]
+    recommendation = client.get(f"/api/incidents/{incident_id}/recommendation").json()
+    valid_payload = {
+        "operator_name": "Test operator",
+        "recommendation_id": recommendation["id"],
+        "action_code": "restore_db_pool_size_50",
+    }
 
-    approved = client.post(
-        f"/api/incidents/{incident_id}/remediation/approve",
-        json={"approved_by": "Test operator"},
+    unapproved = client.post(f"/api/incidents/{incident_id}/simulate-fix", json=valid_payload)
+    assert unapproved.status_code == 409
+    assert "approval" in unapproved.json()["detail"].lower()
+
+    disallowed = client.post(
+        f"/api/incidents/{incident_id}/approve",
+        json={**valid_payload, "action_code": "delete_database"},
     )
+    assert disallowed.status_code == 409
+    assert "allowlist" in disallowed.json()["detail"].lower()
+
+    with factory() as db:
+        database = db.scalar(select(Service).where(Service.name == "Database Service"))
+        assert database is not None
+        pool = db.scalar(
+            select(Metric.value)
+            .where(Metric.service_id == database.id, Metric.metric_name == "db_pool_size")
+            .order_by(Metric.timestamp.desc(), Metric.id.desc())
+        )
+        assert pool == 10
+        incident = db.get(Incident, incident_id)
+        assert incident is not None and incident.status == "investigating"
+        event_types = set(db.scalars(select(RemediationAuditEvent.event_type)).all())
+        assert "execution_rejected" in event_types
+        assert "approval_rejected" in event_types
+
+
+def test_approved_simulation_compares_metrics_and_resolves_only_after_thresholds_pass(test_app):
+    client, factory = test_app
+    started = client.post("/api/simulation/start").json()
+    incident_id = started["active_incident_id"]
+    recommendation = client.get(f"/api/incidents/{incident_id}/recommendation").json()
+    assert recommendation["incident_id"] == incident_id
+    assert recommendation["action"] == "Restore the simulated DB_POOL_SIZE from 10 to 50."
+    assert recommendation["risk"] == "medium"
+    assert recommendation["reason"]
+    assert recommendation["supporting_evidence"]
+    assert recommendation["expected_impact"]
+    assert recommendation["preconditions"]
+    assert recommendation["rollback_plan"]
+    assert recommendation["approval_status"] == "pending"
+
+    payload = {
+        "operator_name": "Test operator",
+        "recommendation_id": recommendation["id"],
+        "action_code": "restore_db_pool_size_50",
+    }
+    approved = client.post(f"/api/incidents/{incident_id}/approve", json=payload)
     assert approved.status_code == 200
     assert approved.json()["state"] == "approved"
-    assert "No production" in approved.json()["result"]
+    assert approved.json()["incident_id"] == incident_id
+    assert client.get(f"/api/incidents/{incident_id}/recommendation").json()["approval_status"] == "approved"
+    assert client.get(f"/api/incidents/{incident_id}").json()["status"] == "investigating"
 
-    validated = client.post(f"/api/remediations/{approved.json()['id']}/validate")
-    assert validated.status_code == 200
-    assert validated.json()["state"] == "validated"
-    assert validated.json()["validation_passed"] is True
-    assert "no production metrics" in validated.json()["result"].lower()
+    executed = client.post(f"/api/incidents/{incident_id}/simulate-fix", json=payload)
+    assert executed.status_code == 200
+    result = executed.json()
+    assert result["state"] == "validated"
+    assert result["validation_passed"] is True
+    assert result["before_metrics"]["database_db_pool_size"] == 10
+    assert result["after_metrics"]["database_db_pool_size"] == 50
+    assert result["before_metrics"] != result["after_metrics"]
+    assert all(result["thresholds"][name] is True for name in (
+        "pool_size_restored",
+        "pool_utilization_within_limit",
+        "database_latency_within_limit",
+        "database_errors_within_limit",
+        "checkout_latency_within_limit",
+        "checkout_errors_within_limit",
+    ))
+    assert client.get(f"/api/incidents/{incident_id}").json()["status"] == "resolved"
+    assert client.get(f"/api/incidents/{incident_id}/recommendation").json()["approval_status"] == "validated"
 
-    incident = client.get(f"/incidents/{incident_id}").json()
-    assert incident["status"] == "resolved"
+    duplicate = client.post(f"/api/incidents/{incident_id}/simulate-fix", json=payload)
+    assert duplicate.status_code == 409
+    metrics = client.get("/api/simulation/metrics").json()
+    assert metrics["state"] == "healthy"
+    assert metrics["active_incident_id"] is None
+    database_metrics = {item["name"]: item for item in metrics["services"]}
+    assert database_metrics["Database Service"]["db_pool_size"] == 50
+    assert all(item["status"] == "Operational" for item in metrics["services"])
+
+    audit = client.get(f"/api/incidents/{incident_id}/audit-log")
+    assert audit.status_code == 200
+    event_types = {item["event_type"] for item in audit.json()["items"]}
+    assert {"recommendation_created", "approval_granted", "execution_succeeded", "execution_rejected"} <= event_types
+    success_event = next(item for item in audit.json()["items"] if item["event_type"] == "execution_succeeded")
+    assert success_event["actor"] == "Test operator"
+    assert success_event["details"]["before_metrics"]["database_db_pool_size"] == 10
+    assert success_event["details"]["after_metrics"]["database_db_pool_size"] == 50
+
     with factory() as db:
-        after_metrics = list(db.scalars(select(Metric.value).order_by(Metric.id)).all())
-        after_services = list(db.scalars(select(Service.status).order_by(Service.id)).all())
-        assert db.scalar(select(func.count()).select_from(Action)) == 1
-    assert after_metrics == before_metrics
-    assert after_services == before_services
+        incident = db.get(Incident, incident_id)
+        recommendation_row = db.scalar(
+            select(Recommendation).where(Recommendation.incident_id == incident_id)
+        )
+        simulation = db.get(CheckoutSimulationState, 1)
+        action = db.scalar(select(Action).where(Action.incident_id == incident_id))
+        assert incident is not None and incident.status == "resolved"
+        assert recommendation_row is not None and recommendation_row.approval_status == "validated"
+        assert simulation is not None and simulation.state == "healthy"
+        assert action is not None and action.status == "simulated_validated"
 
-    report = client.post(f"/incidents/{incident_id}/postmortem/generate")
-    assert report.status_code == 200
-    assert "not generated by AI" in report.json()["summary"]
-    assert client.get(f"/incidents/{incident_id}/postmortem").status_code == 200
+
+def test_safe_reset_cancels_approval_and_invalid_state_cannot_execute(test_app):
+    client, factory = test_app
+    started = client.post("/api/simulation/start").json()
+    incident_id = started["active_incident_id"]
+    recommendation = client.get(f"/api/incidents/{incident_id}/recommendation").json()
+    payload = {
+        "operator_name": "Reset operator",
+        "recommendation_id": recommendation["id"],
+        "action_code": "restore_db_pool_size_50",
+    }
+    assert client.post(f"/api/incidents/{incident_id}/approve", json=payload).status_code == 200
+
+    reset = client.post("/api/simulation/reset")
+    assert reset.status_code == 200
+    assert reset.json()["state"] == "healthy"
+    assert reset.json()["active_incident_id"] is None
+    assert reset.json()["services"][3]["db_pool_size"] == 50
+
+    stale_execution = client.post(f"/api/incidents/{incident_id}/simulate-fix", json=payload)
+    assert stale_execution.status_code == 409
+    assert client.get(f"/api/incidents/{incident_id}").json()["status"] == "investigating"
+    assert client.get(f"/api/incidents/{incident_id}/recommendation").json()["approval_status"] == "cancelled"
+    audit = client.get(f"/api/incidents/{incident_id}/audit-log").json()["items"]
+    assert any(item["event_type"] == "simulation_reset" for item in audit)
+    assert any(item["event_type"] == "execution_rejected" for item in audit)
+
+    with factory() as db:
+        action = db.scalar(select(Action).where(Action.incident_id == incident_id))
+        assert action is not None and action.status == "rejected"
+        incident = db.get(Incident, incident_id)
+        assert incident is not None and incident.resolved_at is None
+
+
+def test_failed_recovery_threshold_rolls_back_and_keeps_incident_open(test_app, monkeypatch):
+    from app.services.remediation import RECOVERY_THRESHOLDS
+
+    monkeypatch.setitem(RECOVERY_THRESHOLDS, "checkout_latency_ms_max", 100)
+    client, factory = test_app
+    started = client.post("/api/simulation/start").json()
+    incident_id = started["active_incident_id"]
+    recommendation = client.get(f"/api/incidents/{incident_id}/recommendation").json()
+    payload = {
+        "operator_name": "Threshold test operator",
+        "recommendation_id": recommendation["id"],
+        "action_code": "restore_db_pool_size_50",
+    }
+    assert client.post(f"/api/incidents/{incident_id}/approve", json=payload).status_code == 200
+
+    failed = client.post(f"/api/incidents/{incident_id}/simulate-fix", json=payload)
+    assert failed.status_code == 200
+    result = failed.json()
+    assert result["validation_passed"] is False
+    assert result["state"] == "rejected"
+    assert result["after_metrics"]["checkout_latency_ms"] == 140
+    assert result["thresholds"]["checkout_latency_within_limit"] is False
+    assert client.get(f"/api/incidents/{incident_id}").json()["status"] == "investigating"
+    assert client.get(f"/api/incidents/{incident_id}/recommendation").json()["approval_status"] == "execution_failed"
+
+    restored = client.get("/api/simulation/metrics").json()
+    assert restored["state"] == "incident"
+    assert restored["active_incident_id"] == incident_id
+    by_name = {service["name"]: service for service in restored["services"]}
+    assert by_name["Database Service"]["db_pool_size"] == 10
+    assert by_name["Database Service"]["latency_ms"] == 1800
+    assert by_name["Checkout Service"]["latency_ms"] == 2100
+    assert all(service["status"] == "Degraded" for service in restored["services"])
+    audit = client.get(f"/api/incidents/{incident_id}/audit-log").json()["items"]
+    failed_event = next(item for item in audit if item["event_type"] == "execution_failed")
+    assert failed_event["details"]["validation_passed"] is False
+
+    with factory() as db:
+        incident = db.get(Incident, incident_id)
+        action = db.scalar(select(Action).where(Action.incident_id == incident_id))
+        simulation = db.get(CheckoutSimulationState, 1)
+        assert incident is not None and incident.resolved_at is None
+        assert action is not None and action.status == "rejected"
+        assert simulation is not None and simulation.state == "incident"
 
 
 def test_legacy_sqlite_data_is_archived_and_migrated_without_loss(tmp_path):
@@ -202,6 +370,57 @@ def test_legacy_sqlite_data_is_archived_and_migrated_without_loss(tmp_path):
             assert "legacy_services" in names
             assert "legacy_incidents" in names
             assert "services" in names and "incidents" in names
+    finally:
+        db_engine.dispose()
+
+
+def test_existing_normalized_sqlite_schema_gets_additive_remediation_migration(tmp_path):
+    db_path = tmp_path / "normalized-before-remediation.sqlite"
+    connection = sqlite3.connect(db_path)
+    connection.executescript(
+        """
+        CREATE TABLE schema_migrations (version VARCHAR(120) PRIMARY KEY, applied_at DATETIME NOT NULL);
+        CREATE TABLE recommendations (
+            id INTEGER PRIMARY KEY, incident_id INTEGER NOT NULL, action TEXT NOT NULL,
+            risk VARCHAR(16) NOT NULL, confidence FLOAT NOT NULL, created_at DATETIME NOT NULL
+        );
+        CREATE TABLE checkout_simulation_state (
+            id INTEGER PRIMARY KEY, state VARCHAR(16) NOT NULL, run_number INTEGER NOT NULL,
+            updated_at DATETIME NOT NULL
+        );
+        INSERT INTO recommendations VALUES (77, 15, 'Preserved old advice', 'low', 0.5, '2026-10-02T00:00:00+00:00');
+        INSERT INTO checkout_simulation_state VALUES (1, 'healthy', 3, '2026-10-02T00:00:00+00:00');
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    db_engine = create_sqlite_engine(f"sqlite:///{db_path}")
+    try:
+        initialize_database(db_engine)
+        with db_engine.connect() as upgraded:
+            recommendation_columns = {column["name"] for column in inspect(upgraded).get_columns("recommendations")}
+            simulation_columns = {
+                column["name"] for column in inspect(upgraded).get_columns("checkout_simulation_state")
+            }
+            preserved = upgraded.exec_driver_sql(
+                "SELECT action, approval_status FROM recommendations WHERE id = 77"
+            ).one()
+            simulation = upgraded.exec_driver_sql(
+                "SELECT state, run_number, active_incident_id FROM checkout_simulation_state WHERE id = 1"
+            ).one()
+        assert {
+            "action_code",
+            "reason",
+            "supporting_evidence",
+            "expected_impact",
+            "preconditions",
+            "rollback_plan",
+            "approval_status",
+        } <= recommendation_columns
+        assert "active_incident_id" in simulation_columns
+        assert preserved == ("Preserved old advice", "pending")
+        assert simulation == ("healthy", 3, None)
     finally:
         db_engine.dispose()
 

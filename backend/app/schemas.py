@@ -143,9 +143,30 @@ class RecommendationOut(BaseModel):
     id: int
     incident_id: int
     action: str
+    action_code: str
     risk: str
     confidence: float
+    reason: str
+    supporting_evidence: list[str]
+    expected_impact: str
+    preconditions: list[str]
+    rollback_plan: str
+    approval_status: str
     created_at: datetime
+
+
+class SimulationApprovalRequest(BaseModel):
+    operator_name: str | None = Field(default=None, max_length=120)
+    action_code: str | None = Field(default=None, max_length=80)
+    recommendation_id: int | None = Field(default=None, ge=1)
+
+    @field_validator("operator_name")
+    @classmethod
+    def trim_operator_name(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        return value or None
 
 
 class ActionDecision(BaseModel):
@@ -200,6 +221,19 @@ class RemediationOut(BaseModel):
     approved_at: datetime | None
     validation_passed: bool | None
     result: str | None
+    before_metrics: dict[str, float | int | str] | None = None
+    after_metrics: dict[str, float | int | str] | None = None
+    thresholds: dict[str, bool | float | int | str] | None = None
+
+
+class RemediationAuditEventOut(BaseModel):
+    id: int
+    incident_id: int | None
+    event_type: str
+    actor: str | None
+    action: str | None
+    details: dict
+    created_at: datetime
 
 
 class RunbookOut(BaseModel):

@@ -210,36 +210,49 @@ def test_structured_agent_output_is_used_but_action_stays_advisory(client_factor
     client.close()
 
 
-def test_validation_compares_only_recorded_post_action_metrics(client_factory):
+def test_investigation_stays_advisory_after_allowlisted_simulated_recovery(client_factory):
     client, factory = client_factory()
     with client:
-        incident = client.get("/api/incidents?limit=1").json()["items"][0]
-        incident_id = incident["id"]
-        approval = client.post(f"/api/incidents/{incident_id}/remediation/approve")
+        started = client.post("/api/simulation/start").json()
+        incident_id = started["active_incident_id"]
+        recommendation = client.get(f"/api/incidents/{incident_id}/recommendation").json()
+        payload = {
+            "operator_name": "Investigation test operator",
+            "recommendation_id": recommendation["id"],
+            "action_code": "restore_db_pool_size_50",
+        }
+        approval = client.post(f"/api/incidents/{incident_id}/approve", json=payload)
         assert approval.status_code == 200
+        execution = client.post(f"/api/incidents/{incident_id}/simulate-fix", json=payload)
+        assert execution.status_code == 200
+        assert execution.json()["validation_passed"] is True
 
         with factory() as db:
             action = db.scalar(
                 select(Action).where(Action.incident_id == incident_id).order_by(Action.created_at.desc())
             )
             incident_row = db.get(Incident, incident_id)
+            assert action and incident_row
             prior = db.scalar(
                 select(Metric)
                 .where(Metric.service_id == incident_row.service_id, Metric.metric_name == "error_rate")
-                .order_by(Metric.timestamp.desc())
+                .order_by(Metric.timestamp.desc(), Metric.id.desc())
             )
-            assert action and prior
+            assert prior
             db.add(Metric(
                 service_id=incident_row.service_id,
                 metric_name="error_rate",
                 value=max(0, prior.value / 2),
-                timestamp=action.created_at + timedelta(seconds=1),
+                timestamp=action.updated_at + timedelta(seconds=1),
             ))
             db.commit()
 
         report = client.post(f"/api/incidents/{incident_id}/ai-investigation").json()
         validation = report["agents"]["validation"]
         assert validation["assessment"] == "metrics_improved"
-        assert validation["observations"][0]["metric"] == "error_rate"
-        assert len(validation["evidence_ids"]) == 2
+        assert any(item["metric"] == "error_rate" for item in validation["observations"])
+        error_observation = next(
+            item for item in validation["observations"] if item["metric"] == "error_rate"
+        )
+        assert len(error_observation["evidence_ids"]) == 2
         assert "synthetic" in validation["detail"]
