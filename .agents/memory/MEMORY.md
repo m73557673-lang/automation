@@ -1,0 +1,1 @@
+- [SQLite environment configuration](sqlite-environment-configuration.md) — Avoid Replit's injected `DATABASE_URL` when this prototype must stay on SQLite.

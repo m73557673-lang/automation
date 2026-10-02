@@ -1,0 +1,57 @@
+Build a full-stack hackathon MVP named "Autonomous AI-Powered Incident Commander" based on these requirements.
+
+PROJECT PURPOSE:
+Create an AI-assisted SRE and DevOps incident response platform that investigates simulated production incidents, correlates operational evidence, retrieves runbooks using RAG, proposes root causes, requires human approval for remediation, validates simulated recovery, and generates postmortems.
+
+TECH STACK:
+
+* Frontend: React, TypeScript, Vite, Tailwind CSS.
+* Backend: Python FastAPI with REST APIs.
+* Database: SQLite for the initial prototype, using SQLAlchemy.
+* Charts: Recharts.
+* AI integration: modular provider adapter, to be added in a later phase.
+* RAG: modular document retrieval layer, to be added in a later phase.
+
+ARCHITECTURE:
+
+* Keep frontend and backend in separate directories.
+* Create a clean, modular, maintainable project structure.
+* Keep business logic in backend services, not React components.
+* Use environment variables for configuration and secrets.
+* Include requirements.txt, package.json, a README and a sample .env.example without real credentials.
+* Configure Replit so the frontend and FastAPI backend can run together.
+* Add health-check and database initialization functionality.
+* Provide useful error messages and structured logging.
+
+INITIAL UI:
+Create a polished, professional enterprise SRE dashboard.
+Use a dark navy background, subtle blue/cyan accents, readable typography, restrained borders and clear information hierarchy.
+Include a left navigation sidebar with:
+
+1. Overview
+2. Incidents
+3. Investigation
+4. Evidence Chain
+5. Services & Metrics
+6. Knowledge Base
+7. Remediation
+8. Postmortems
+9. Settings
+
+The initial overview should include summary cards for active incidents, critical incidents, affected services and recovery status, plus incident tables, a recent activity timeline and metric chart placeholders.
+
+FUNCTIONAL REQUIREMENTS:
+
+* Navigation must work.
+* Show clear loading, empty and error states.
+* Do not present fabricated metrics as live production telemetry.
+* Any initial demo data must be labelled as synthetic.
+* Do not create decorative buttons that do nothing.
+* Do not implement real infrastructure remediation.
+* Do not connect to production systems.
+* Do not add authentication unless needed for the initial app foundation.
+
+DELIVERY:
+First inspect the environment and create the smallest working full-stack application. Start both frontend and backend using Replit's supported workflow. Verify that the frontend loads and the backend health endpoint responds successfully.
+
+Do not merely describe the implementation. Create the actual files and run the application. Summarize the files created, commands used, and any remaining errors when finished.
