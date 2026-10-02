@@ -147,7 +147,7 @@ export default function App() {
       const created = await api.createIncident({
         title: String(form.get("title") || ""),
         severity: String(form.get("severity") || "medium") as Incident["severity"],
-        service: String(form.get("service") || ""),
+        service_id: Number(form.get("service_id")),
         summary: String(form.get("summary") || ""),
       });
       setIncidents((old) => [created, ...old]);
@@ -221,6 +221,12 @@ export default function App() {
           <div className="confidence">{item.confidence === null ? "—" : `${Math.round(item.confidence * 100)}% conf.`}</div>
         </div>) : <EmptyState title="No evidence recorded" detail="This synthetic scenario has no evidence records yet." />}</div>
       </Surface>
+      <Surface title="Metric snapshots" kicker={`${investigation.metrics.length} records · local database`}>
+        <div className="surface-body">{investigation.metrics.length ? investigation.metrics.map((metric) => <div className="activity-item" key={metric.id}>
+          <div className="activity-mark" /><div><div className="activity-title">{metric.metric_name.replace(/_/g, " ")}</div>
+            <div className="activity-detail">{metric.value} · {new Date(metric.timestamp).toLocaleString()}</div></div>
+        </div>) : <EmptyState title="No metric snapshots" detail="No metric records are linked to this incident's service and time window." />}</div>
+      </Surface>
     </>;
   }
 
@@ -231,6 +237,10 @@ export default function App() {
     return <div className="section-grid">
       <Surface title="Operator decision" kicker={`INC-${String(selected.id).padStart(4, "0")} · simulated`}>
         <div className="surface-body">
+          {investigation?.recommendation && <div className="notice" style={{ marginTop: 0 }}>
+            Recorded guidance · {investigation.recommendation.risk} risk · {Math.round(investigation.recommendation.confidence * 100)}% confidence.
+            {" "}{investigation.recommendation.action} This deterministic guidance is not AI output and does not execute an action.
+          </div>}
           {remediation ? <div className="remediation-box">
             <div className="detail-heading"><div className="remediation-action">{remediation.action}</div><Status value={remediation.state} /></div>
             <p className="remediation-copy">{remediation.result || "Proposed response for this simulated scenario. Review carefully before recording a decision."}</p>
@@ -265,11 +275,11 @@ export default function App() {
       const latencyData = service.latency_history.map((value, index) => ({ point: index + 1, value }));
       const errorData = service.error_history.map((value, index) => ({ point: index + 1, value }));
       return <article className="service-card" key={service.id}>
-        <div className="service-top"><div><div className="service-name">{service.name}</div><div className="service-owner">Owner: {service.owner} · {service.tier}</div></div><span className="simulation-tag">Synthetic</span></div>
+        <div className="service-top"><div><div className="service-name">{service.name}</div><div className="service-owner">Owner: {service.owner} · {service.environment}</div></div><span className="simulation-tag">Synthetic</span></div>
         <div className="service-metrics">
-          <div><div className="metric-label">Latency</div><div className="metric-value">{service.latency_ms} ms</div></div>
-          <div><div className="metric-label">Error rate</div><div className="metric-value">{service.error_rate}%</div></div>
-          <div><div className="metric-label">Request rate</div><div className="metric-value">{service.request_rate}/s</div></div>
+          <div><div className="metric-label">Latency</div><div className="metric-value">{service.latency_ms ?? "—"} ms</div></div>
+          <div><div className="metric-label">Error rate</div><div className="metric-value">{service.error_rate ?? "—"}%</div></div>
+          <div><div className="metric-label">Request rate</div><div className="metric-value">{service.request_rate ?? "—"}/s</div></div>
         </div>
         <div className="section-grid" style={{ gap: 10, marginTop: 13 }}>
           <div><div className="chart-caption">Latency history · simulated</div><div className="chart-wrap"><ResponsiveContainer width="100%" height="100%"><AreaChart data={latencyData}><defs><linearGradient id={`lat-${service.id}`} x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor="#64d7e7" stopOpacity={.23} /><stop offset="100%" stopColor="#64d7e7" stopOpacity={0} /></linearGradient></defs><CartesianGrid stroke="#203247" vertical={false} /><XAxis dataKey="point" hide /><YAxis hide /><Tooltip contentStyle={{ background: "#101e2e", border: "1px solid #30475c", borderRadius: 5, color: "#dce7f2", fontSize: 10 }} /><Area type="monotone" dataKey="value" stroke="#64d7e7" fill={`url(#lat-${service.id})`} strokeWidth={1.5} /></AreaChart></ResponsiveContainer></div></div>
@@ -412,10 +422,10 @@ export default function App() {
         <div className="modal-head"><div><h2 id="create-title">Create simulated incident</h2><div className="surface-kicker">This creates a synthetic scenario only</div></div><button className="button ghost small" aria-label="Close dialog" onClick={() => setCreateOpen(false)}><X size={15} /></button></div>
         <form className="modal-form" onSubmit={(event) => void createIncident(event)}>
           <div className="field"><label htmlFor="incident-title">Scenario title</label><input id="incident-title" name="title" required maxLength={120} placeholder="e.g. Elevated checkout latency" /></div>
-          <div className="section-grid" style={{ gap: 10 }}><div className="field"><label htmlFor="incident-severity">Severity</label><select id="incident-severity" name="severity" defaultValue="medium"><option value="critical">Critical</option><option value="high">High</option><option value="medium">Medium</option><option value="low">Low</option></select></div><div className="field"><label htmlFor="incident-service">Service</label><input id="incident-service" name="service" required maxLength={80} placeholder="Service name" /></div></div>
-          <div className="field"><label htmlFor="incident-summary">Scenario summary</label><textarea id="incident-summary" name="summary" required maxLength={1000} placeholder="Describe the simulated symptoms and context…" /></div>
+          <div className="section-grid" style={{ gap: 10 }}><div className="field"><label htmlFor="incident-severity">Severity</label><select id="incident-severity" name="severity" defaultValue="medium"><option value="critical">Critical</option><option value="high">High</option><option value="medium">Medium</option><option value="low">Low</option></select></div><div className="field"><label htmlFor="incident-service">Service</label><select id="incident-service" name="service_id" required defaultValue=""><option value="" disabled>Select a service</option>{services.map((service) => <option key={service.id} value={service.id}>{service.name}</option>)}</select></div></div>
+          <div className="field"><label htmlFor="incident-summary">Scenario summary</label><textarea id="incident-summary" name="summary" required minLength={8} maxLength={1000} placeholder="Describe the simulated symptoms and context…" /></div>
           <div className="notice" style={{ marginTop: 0 }}>No production telemetry is used and no infrastructure can be modified.</div>
-          <div className="modal-actions"><button type="button" className="button" onClick={() => setCreateOpen(false)}>Cancel</button><button className="button primary" type="submit" disabled={submitting}>{submitting ? "Creating…" : "Create scenario"}</button></div>
+          <div className="modal-actions"><button type="button" className="button" onClick={() => setCreateOpen(false)}>Cancel</button><button className="button primary" type="submit" disabled={submitting || services.length === 0}>{submitting ? "Creating…" : services.length ? "Create scenario" : "No services available"}</button></div>
         </form>
       </section>
     </div>}

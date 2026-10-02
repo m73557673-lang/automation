@@ -3,21 +3,35 @@ export type Incident = {
   title: string;
   severity: "critical" | "high" | "medium" | "low";
   status: "open" | "investigating" | "mitigated" | "resolved";
+  service_id: number;
   service: string;
   summary: string;
   source: string;
   is_synthetic: boolean;
   created_at: string;
+  resolved_at: string | null;
 };
 
 export type Evidence = {
   id: number;
   incident_id: number;
+  source_type: string;
+  source_id: number;
+  relevance: number;
   kind: string;
   source: string;
   message: string;
   observed_at: string;
   confidence: number | null;
+  created_at: string;
+};
+
+export type Metric = {
+  id: number;
+  service_id: number;
+  timestamp: string;
+  metric_name: string;
+  value: number;
 };
 
 export type Runbook = {
@@ -31,15 +45,24 @@ export type Runbook = {
 export type Service = {
   id: number;
   name: string;
+  environment: string;
   owner: string;
-  tier: string;
   status: string;
-  latency_ms: number;
-  error_rate: number;
-  request_rate: number;
+  latency_ms: number | null;
+  error_rate: number | null;
+  request_rate: number | null;
   latency_history: number[];
   error_history: number[];
   is_synthetic: boolean;
+};
+
+export type Recommendation = {
+  id: number;
+  incident_id: number;
+  action: string;
+  risk: "low" | "medium" | "high";
+  confidence: number;
+  created_at: string;
 };
 
 export type Remediation = {
@@ -73,16 +96,27 @@ export type Dashboard = {
   incidents: Incident[];
   activity: { id: number; incident_id: number; title: string; detail: string; occurred_at: string }[];
   services: Service[];
-  synthetic: true;
+  synthetic: boolean;
 };
 
 export type Investigation = {
   incident: Incident;
   evidence: Evidence[];
+  metrics: Metric[];
   runbooks: Runbook[];
+  recommendation: Recommendation | null;
   remediation: Remediation | null;
   postmortem: Postmortem | null;
 };
+
+type Page<T> = { items: T[]; total: number; skip: number; limit: number };
+
+class ApiError extends Error {
+  constructor(message: string, readonly status: number) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`/api${path}`, {
@@ -91,27 +125,105 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   });
   if (!response.ok) {
     const body = await response.json().catch(() => null);
-    throw new Error(body?.detail || `Request failed (${response.status})`);
+    const detail = typeof body?.detail === "string"
+      ? body.detail
+      : Array.isArray(body?.errors)
+        ? body.errors.map((item: { message?: string }) => item.message).filter(Boolean).join(" ")
+        : `Request failed (${response.status})`;
+    throw new ApiError(detail, response.status);
   }
   return response.json() as Promise<T>;
+}
+
+async function pageItems<T>(path: string): Promise<T[]> {
+  const page = await request<Page<T>>(path);
+  return page.items;
+}
+
+async function optional<T>(path: string): Promise<T | null> {
+  try {
+    return await request<T>(path);
+  } catch (error) {
+    if (error instanceof ApiError && error.status === 404) return null;
+    throw error;
+  }
+}
+
+function toRemediation(action: {
+  id: number;
+  incident_id: number;
+  action: string;
+  status: string;
+  result: string | null;
+  created_at: string;
+  updated_at: string;
+}): Remediation {
+  return {
+    id: action.id,
+    incident_id: action.incident_id,
+    action: action.action,
+    state: action.status === "simulated_validated" ? "validated" : action.status as Remediation["state"],
+    created_at: action.created_at,
+    approved_at: action.status === "approved" || action.status === "simulated_validated" ? action.updated_at : null,
+    validation_passed: action.status === "simulated_validated" ? true : null,
+    result: action.result,
+  };
 }
 
 export const api = {
   health: () => request<{ status: string; database: string }>("/health"),
   dashboard: () => request<Dashboard>("/dashboard"),
-  incidents: () => request<Incident[]>("/incidents"),
-  createIncident: (data: { title: string; severity: Incident["severity"]; service: string; summary: string }) =>
-    request<Incident>("/incidents", { method: "POST", body: JSON.stringify(data) }),
-  investigation: (id: number) => request<Investigation>(`/incidents/${id}/investigation`),
-  services: () => request<Service[]>("/services"),
-  knowledge: (query: string) => request<Runbook[]>(`/knowledge?q=${encodeURIComponent(query)}`),
+  incidents: () => pageItems<Incident>("/incidents?skip=0&limit=100"),
+  createIncident: (data: {
+    title: string;
+    severity: Incident["severity"];
+    service_id: number;
+    summary: string;
+  }) => request<Incident>("/incidents", { method: "POST", body: JSON.stringify(data) }),
+  investigation: async (id: number): Promise<Investigation> => {
+    const incident = await request<Incident>(`/incidents/${id}`);
+    const query = new URLSearchParams({ q: incident.service, skip: "0", limit: "100" });
+    const [evidence, metrics, runbooks, recommendation, actions, postmortem] = await Promise.all([
+      pageItems<Evidence>(`/incidents/${id}/evidence?skip=0&limit=100`),
+      pageItems<Metric>(`/incidents/${id}/metrics?skip=0&limit=100`),
+      pageItems<Runbook>(`/knowledge?${query.toString()}`),
+      optional<Recommendation>(`/incidents/${id}/recommendation`),
+      pageItems<{
+        id: number;
+        incident_id: number;
+        action: string;
+        status: string;
+        result: string | null;
+        created_at: string;
+        updated_at: string;
+      }>(`/incidents/${id}/actions?skip=0&limit=100`),
+      optional<Postmortem>(`/incidents/${id}/postmortem`),
+    ]);
+    return {
+      incident,
+      evidence,
+      metrics,
+      runbooks,
+      recommendation,
+      remediation: actions[0] ? toRemediation(actions[0]) : null,
+      postmortem,
+    };
+  },
+  services: () => pageItems<Service>("/services?skip=0&limit=100"),
+  knowledge: (query: string) => pageItems<Runbook>(`/knowledge?q=${encodeURIComponent(query)}&skip=0&limit=100`),
   approveRemediation: (incidentId: number) =>
-    request<Remediation>(`/incidents/${incidentId}/remediation/approve`, { method: "POST" }),
+    request<Remediation>(`/incidents/${incidentId}/remediation/approve`, {
+      method: "POST",
+      body: JSON.stringify({ approved_by: "On-call operator" }),
+    }),
   rejectRemediation: (incidentId: number) =>
-    request<Remediation>(`/incidents/${incidentId}/remediation/reject`, { method: "POST" }),
+    request<Remediation>(`/incidents/${incidentId}/remediation/reject`, {
+      method: "POST",
+      body: JSON.stringify({ approved_by: "On-call operator" }),
+    }),
   validateRecovery: (remediationId: number) =>
     request<Remediation>(`/remediations/${remediationId}/validate`, { method: "POST" }),
-  postmortems: () => request<Postmortem[]>("/postmortems"),
+  postmortems: () => pageItems<Postmortem>("/postmortems?skip=0&limit=100"),
   generatePostmortem: (incidentId: number) =>
     request<Postmortem>(`/incidents/${incidentId}/postmortem/generate`, { method: "POST" }),
 };

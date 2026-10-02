@@ -1,0 +1,206 @@
+import sqlite3
+from datetime import datetime, timezone
+
+import pytest
+from fastapi.testclient import TestClient
+from sqlalchemy import func, select
+from sqlalchemy.orm import sessionmaker
+
+from app.database import create_sqlite_engine, get_db, initialize_database
+from app.main import create_app
+from app.models import Action, Incident, Metric, Service
+
+
+@pytest.fixture
+def test_app(tmp_path):
+    db_engine = create_sqlite_engine(f"sqlite:///{tmp_path / 'api-tests.sqlite'}")
+    factory = sessionmaker(bind=db_engine, autoflush=False, expire_on_commit=False)
+    application = create_app(db_engine)
+
+    def override_get_db():
+        with factory() as db:
+            yield db
+
+    application.dependency_overrides[get_db] = override_get_db
+    try:
+        with TestClient(application) as client:
+            yield client, factory
+    finally:
+        db_engine.dispose()
+
+
+def test_health_and_paginated_collections_are_available_at_both_prefixes(test_app):
+    client, _ = test_app
+    for path in ("/health", "/api/health"):
+        response = client.get(path)
+        assert response.status_code == 200
+        assert response.json() == {"status": "ok", "database": "connected"}
+
+    services = client.get("/services?skip=1&limit=2")
+    assert services.status_code == 200
+    assert services.json()["total"] == 4
+    assert len(services.json()["items"]) == 2
+    assert services.json()["skip"] == 1
+
+    incidents = client.get("/api/incidents?skip=1&limit=1")
+    assert incidents.status_code == 200
+    assert incidents.json()["total"] == 3
+    assert len(incidents.json()["items"]) == 1
+    assert incidents.json()["items"][0]["service_id"] > 0
+
+
+def test_incident_create_validation_and_related_records(test_app):
+    client, _ = test_app
+    service_id = client.get("/services?limit=1").json()["items"][0]["id"]
+
+    invalid = client.post("/incidents", json={
+        "title": " ",
+        "severity": "urgent",
+        "service_id": service_id,
+    })
+    assert invalid.status_code == 422
+    assert "errors" in invalid.json()
+
+    created = client.post("/api/incidents", json={
+        "title": "Scenario created in API test",
+        "severity": "high",
+        "service_id": service_id,
+        "summary": "A synthetic test symptom with enough context.",
+    })
+    assert created.status_code == 201
+    incident = created.json()
+    incident_id = incident["id"]
+    assert incident["service_id"] == service_id
+    assert incident["summary"] == "A synthetic test symptom with enough context."
+    assert incident["is_synthetic"] is True
+
+    detail = client.get(f"/incidents/{incident_id}")
+    assert detail.status_code == 200
+    assert detail.json()["title"] == incident["title"]
+    assert client.get(f"/incidents/{incident_id}/evidence").json()["total"] == 1
+    recommendation = client.get(f"/incidents/{incident_id}/recommendation")
+    assert recommendation.status_code == 200
+    assert "No infrastructure action" in recommendation.json()["action"]
+    assert client.get(f"/incidents/{incident_id}/metrics").status_code == 200
+    assert client.get(f"/incidents/{incident_id}/postmortem").status_code == 404
+
+    missing_service = client.post("/incidents", json={
+        "title": "Unknown service scenario",
+        "severity": "low",
+        "service_id": 999999,
+    })
+    assert missing_service.status_code == 404
+
+
+def test_simulated_approval_and_validation_never_change_metric_records(test_app):
+    client, factory = test_app
+    incident_id = client.get("/incidents?limit=1").json()["items"][0]["id"]
+    with factory() as db:
+        before_metrics = list(db.scalars(select(Metric.value).order_by(Metric.id)).all())
+        before_services = list(db.scalars(select(Service.status).order_by(Service.id)).all())
+
+    approved = client.post(
+        f"/api/incidents/{incident_id}/remediation/approve",
+        json={"approved_by": "Test operator"},
+    )
+    assert approved.status_code == 200
+    assert approved.json()["state"] == "approved"
+    assert "No production" in approved.json()["result"]
+
+    validated = client.post(f"/api/remediations/{approved.json()['id']}/validate")
+    assert validated.status_code == 200
+    assert validated.json()["state"] == "validated"
+    assert validated.json()["validation_passed"] is True
+    assert "no production metrics" in validated.json()["result"].lower()
+
+    incident = client.get(f"/incidents/{incident_id}").json()
+    assert incident["status"] == "resolved"
+    with factory() as db:
+        after_metrics = list(db.scalars(select(Metric.value).order_by(Metric.id)).all())
+        after_services = list(db.scalars(select(Service.status).order_by(Service.id)).all())
+        assert db.scalar(select(func.count()).select_from(Action)) == 1
+    assert after_metrics == before_metrics
+    assert after_services == before_services
+
+    report = client.post(f"/incidents/{incident_id}/postmortem/generate")
+    assert report.status_code == 200
+    assert "not generated by AI" in report.json()["summary"]
+    assert client.get(f"/incidents/{incident_id}/postmortem").status_code == 200
+
+
+def test_legacy_sqlite_data_is_archived_and_migrated_without_loss(tmp_path):
+    db_path = tmp_path / "legacy.sqlite"
+    connection = sqlite3.connect(db_path)
+    now = datetime.now(timezone.utc).isoformat()
+    connection.executescript(
+        """
+        CREATE TABLE services (
+            id INTEGER PRIMARY KEY, name TEXT, owner TEXT, tier TEXT, status TEXT,
+            latency_ms REAL, error_rate REAL, request_rate REAL,
+            latency_history TEXT, error_history TEXT, is_synthetic BOOLEAN
+        );
+        CREATE TABLE incidents (
+            id INTEGER PRIMARY KEY, title TEXT, severity TEXT, status TEXT,
+            service TEXT, summary TEXT, source TEXT, is_synthetic BOOLEAN, created_at TEXT
+        );
+        CREATE TABLE evidence (
+            id INTEGER PRIMARY KEY, incident_id INTEGER, kind TEXT, source TEXT,
+            message TEXT, observed_at TEXT, confidence REAL
+        );
+        CREATE TABLE runbooks (
+            id INTEGER PRIMARY KEY, title TEXT, service TEXT, content TEXT, tags TEXT
+        );
+        CREATE TABLE remediations (
+            id INTEGER PRIMARY KEY, incident_id INTEGER, action TEXT, state TEXT,
+            created_at TEXT, approved_at TEXT, validation_passed BOOLEAN, result TEXT
+        );
+        CREATE TABLE postmortems (
+            id INTEGER PRIMARY KEY, incident_id INTEGER, title TEXT, summary TEXT,
+            root_cause TEXT, impact TEXT, prevention TEXT, created_at TEXT, is_synthetic BOOLEAN
+        );
+        """
+    )
+    connection.execute(
+        "INSERT INTO services VALUES (7, 'legacy-api', 'Platform', 'Tier 1', 'Degraded', 250, 1.5, 80, '[100,250]', '[0.2,1.5]', 1)"
+    )
+    connection.execute(
+        "INSERT INTO incidents VALUES (11, 'Legacy scenario', 'high', 'investigating', 'legacy-api', 'Preserve this summary', 'synthetic scenario', 1, ?)",
+        (now,),
+    )
+    connection.execute(
+        "INSERT INTO evidence VALUES (13, 11, 'log', 'legacy api', 'Preserve this signal', ?, 0.88)",
+        (now,),
+    )
+    connection.execute(
+        "INSERT INTO runbooks VALUES (17, 'Legacy runbook', 'legacy-api', 'Keep this procedure', 'legacy,test')"
+    )
+    connection.execute(
+        "INSERT INTO remediations VALUES (19, 11, 'Review only', 'validated', ?, ?, 1, 'Imported simulation')",
+        (now, now),
+    )
+    connection.execute(
+        "INSERT INTO postmortems VALUES (23, 11, 'Legacy review', 'Keep report', 'Recorded cause', 'No real impact', 'Review signals', ?, 1)",
+        (now,),
+    )
+    connection.commit()
+    connection.close()
+
+    db_engine = create_sqlite_engine(f"sqlite:///{db_path}")
+    try:
+        initialize_database(db_engine)
+        factory = sessionmaker(bind=db_engine, autoflush=False, expire_on_commit=False)
+        with factory() as db:
+            service = db.get(Service, 7)
+            incident = db.get(Incident, 11)
+            assert service is not None and service.name == "legacy-api"
+            assert incident is not None and incident.title == "Legacy scenario"
+            assert db.scalar(select(func.count()).select_from(Metric)) >= 4
+            assert db.scalar(select(Action.status).where(Action.id == 19)) == "simulated_validated"
+
+        with db_engine.connect() as connection:
+            names = set(__import__("sqlalchemy").inspect(connection).get_table_names())
+            assert "legacy_services" in names
+            assert "legacy_incidents" in names
+            assert "services" in names and "incidents" in names
+    finally:
+        db_engine.dispose()

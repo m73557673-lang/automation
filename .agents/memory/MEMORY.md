@@ -1,1 +1,2 @@
 - [SQLite environment configuration](sqlite-environment-configuration.md) — Avoid Replit's injected `DATABASE_URL` when this prototype must stay on SQLite.
+- [Incident commander phase boundaries](incident-commander-phase-boundaries.md) — Keep recommendations and action checks deterministic/simulated; preserve existing SQLite records during schema work.
